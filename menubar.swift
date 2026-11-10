@@ -15,6 +15,8 @@ struct Account: Decodable, Identifiable {
     let pendingFailures: [Failure]?
     var stats: String? = nil
     var confirmed: Bool? = nil
+    var displayName: String? = nil
+    var displayOrg: String? = nil
     var identityState: String? = nil
     var pendingAction: String? = nil
     var pendingWaiting: [HeldRecord]? = nil
@@ -36,8 +38,8 @@ struct Account: Decodable, Identifiable {
     var kept: Bool? = nil
     var id: String { account + "/" + org }
     var selector: String { account + " " + org }
-    var name: String { email ?? String(account.prefix(8)) }
-    var plan: String { orgName ?? String(org.prefix(8)) }
+    var name: String { displayName ?? email ?? "Unidentified account \(account.prefix(8))" }
+    var plan: String { displayOrg ?? orgName ?? "Unknown org \(org.prefix(8))" }
 }
 
 struct SelectableSession: Decodable, Identifiable {
@@ -1333,6 +1335,7 @@ struct Row: View {
         }
         .buttonStyle(.plain)
         .opacity(muted ? 0.35 : 1)
+        .help("Account ID: \(account.account)\nOrganization ID: \(account.org)\nNames may be local labels. Stored history does not prove current membership.")
         .anchorPreference(key: RowKey.self, value: .bounds) { [(radio ? "to/" : "from/") + account.id: $0] }
     }
 }

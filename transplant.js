@@ -1218,6 +1218,8 @@ const desktopSession = (file, record) => ({
 export async function accounts(paths, processes = null) {
   const { emails, orgs, pairs, confirmed } = await logins(paths)
   const cur = await signedIn(paths, processes)
+  const aliases = await readJson(path.join(paths.state, 'account-labels.json')).catch(() => ({}))
+  const aliasText = value => typeof value === 'string' && value.trim() && value.length <= 100 && !/[\x00-\x1f\x7f]/.test(value) ? value.trim() : null
   const out = []
   const stored = await records(paths.records)
   const known = [...pairs.values()].filter((pair) => !stored.some((row) => sameAccount(row, pair))).map(({ account, org }) => ({ account, org, dir: path.join(paths.records, account, org), files: [] }))
@@ -1236,10 +1238,13 @@ export async function accounts(paths, processes = null) {
     let scheduled = new Set()
     let taskError = null
     try { scheduled = await taskSessions(taskFile) } catch (error) { taskError = error.message }
-    const label = `${email ?? short(account)} · ${orgName ?? short(org)}`
+    const alias = aliases?.[`${account}/${org}`]
+    const displayName = aliasText(alias?.name) ?? email ?? `Unidentified account ${short(account)}`
+    const displayOrg = aliasText(alias?.org) ?? orgName ?? `Unknown org ${short(org)}`
+    const label = `${displayName} · ${displayOrg}`
     const base = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | -'
     const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}${taskError ? ' | task registry unreadable' : ''}`
-    out.push({ account, org, dir, email, orgName, confirmed: confirmed.has(`${account}/${org}`), sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state })
+    out.push({ account, org, dir, email, orgName, displayName, displayOrg, confirmed: confirmed.has(`${account}/${org}`), sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state })
   }
   const sessions = out.flatMap(account => account.sessions)
   const claims = Map.groupBy(sessions.flatMap(session => [...new Set([session.id, ...priorSessions(session.record)])]), id => id)
@@ -5493,7 +5498,7 @@ async function main(argv) {
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
       const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? latest.receipt.to : null
-      return emit(all.map(({ account, org, email, orgName, confirmed, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
+      return emit(all.map(({ account, org, email, orgName, displayName, displayOrg, confirmed, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         const waiting = source ? deferred.mode === 'local'
           ? waitingSessions({ held: deferred.receipt.held?.filter(held => held.sources.some(member => sameAccount(member, source))), cloudChecks: deferred.receipt.cloudChecks.filter(check => sameAccount(check, source)) })
@@ -5507,6 +5512,8 @@ async function main(argv) {
           org,
           email,
           orgName,
+          displayName,
+          displayOrg,
           confirmed,
           label,
           stats,

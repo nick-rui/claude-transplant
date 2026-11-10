@@ -12401,3 +12401,21 @@ test('selective: held recovery keeps its selection after unselected sessions app
   assert.equal(finished.receipt.selectionScoped, true)
   assert.ok(await stat(path.join(h.dir('P'), `local_${untouched}.json`)))
 })
+
+
+test('account display aliases preserve identity and ignore malformed labels', async () => {
+  const h = await home()
+  const original = (await accounts(h.paths, [])).find(a => a.account === h.acct.P)
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, 'account-labels.json'), JSON.stringify({
+    [`${h.acct.P}/${h.org.P}`]: { name: 'Work login', org: 'Research team' },
+    [`${h.acct.T}/${h.org.T}`]: { name: { invalid: true }, org: 'Bad\nlabel' }
+  }))
+  const all = await accounts(h.paths, []), renamed = all.find(a => a.account === h.acct.P)
+  assert.equal(renamed.label, 'Work login · Research team')
+  for (const key of ['account', 'org', 'email', 'orgName', 'confirmed', 'active']) assert.equal(renamed[key], original[key])
+  assert.equal(all.find(a => a.account === h.acct.T).displayName, 't@example.com')
+  assert.equal(all.find(a => a.account === h.acct.T).displayOrg, 'Team T')
+  await writeFile(path.join(h.paths.state, 'account-labels.json'), '{broken')
+  assert.equal((await accounts(h.paths, [])).find(a => a.account === h.acct.P).label, original.label)
+})
