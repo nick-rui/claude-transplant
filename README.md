@@ -10,7 +10,7 @@ With Node 22 or newer and the Xcode command-line tools installed, run this from 
 node transplant.js menubar
 ```
 
-This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel says **Nick's fork**, with version **4.2.1-nick.3**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
+This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel shows version **4.2.1-nick.4**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
 
 ## Choose what to move
 
@@ -19,7 +19,7 @@ This replaces the installed menu-bar app and retains its existing receipts, back
 3. Check individual sessions, or explicitly choose Select shown. No sessions are selected automatically.
 4. Review the selected titles and destination, then move. The existing restart warning appears separately when needed.
 
-Drag the handle beside an account to reorder it within either column. From and To have independent orders, saved across restarts in `~/Library/Application Support/claude-transplant/account-order.json`. Reordering does not select accounts or move sessions. New accounts appear after saved entries.
+Drag anywhere on an account row to reorder it within either column. The row follows the pointer while neighboring rows animate into their new positions; releasing saves the order, and cancelling restores it. From and To have independent orders, saved across restarts in `~/Library/Application Support/claude-transplant/account-order.json`. Reordering does not select accounts or move sessions. New accounts appear after saved entries.
 
 Related forks, shared session records, and scheduled-task sessions are selected as a group. The selected count includes related sessions outside the search/date filter. The backend rejects incomplete groups, disappeared sessions, unreadable source metadata, and attempts to widen the selection after a restart plan.
 

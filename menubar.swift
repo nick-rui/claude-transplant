@@ -314,6 +314,16 @@ struct MoveProgress {
     }
 }
 
+struct AccountDrag {
+    let token: String
+    let id: String
+    let column: String
+    let original: [String]
+    let start: Int
+    var preview: [String]
+    var translation: CGFloat = 0
+}
+
 @MainActor
 final class Model: ObservableObject {
     @Published var accounts: [Account] = []
@@ -323,7 +333,8 @@ final class Model: ObservableObject {
     @Published var lanes: [String: String] = [:]
     @Published private var accountOrder: [String: [String]] = [:]
     private let orderFile: URL?
-    private var accountDrag: (token: String, id: String, column: String)?
+    @Published private var accountDrag: AccountDrag?
+    static let accountRowStep: CGFloat = 50
     @Published var lines: [(String, String)] = []
     @Published var detailsExpanded = false
     @Published var note = ""
@@ -431,7 +442,7 @@ final class Model: ObservableObject {
     }
 
     func orderedAccounts(_ column: String) -> [Account] {
-        let saved = accountOrder[column] ?? []
+        let saved = accountDrag.flatMap { $0.column == column ? $0.preview : nil } ?? accountOrder[column] ?? []
         return visibleAccounts.enumerated().sorted { left, right in
             let l = saved.firstIndex(of: left.element.id) ?? saved.count + left.offset
             let r = saved.firstIndex(of: right.element.id) ?? saved.count + right.offset
@@ -440,17 +451,49 @@ final class Model: ObservableObject {
     }
 
     func beginAccountDrag(_ id: String, column: String) -> String {
+        cancelAccountDrag()
         let token = UUID().uuidString
-        accountDrag = canMutate && movable && ["from", "to"].contains(column) && visibleAccounts.contains(where: { $0.id == id }) ? (token, id, column) : nil
+        let ids = orderedAccounts(column).map(\.id)
+        guard canMutate, movable, ["from", "to"].contains(column), let index = ids.firstIndex(of: id) else { return token }
+        accountDrag = AccountDrag(token: token, id: id, column: column, original: ids, start: index, preview: ids)
         return token
     }
 
+    func isDraggingAccount(_ id: String, column: String) -> Bool {
+        accountDrag?.id == id && accountDrag?.column == column
+    }
+
+    func accountOffset(_ id: String, column: String) -> CGFloat {
+        if let drag = accountDrag, drag.id == id, drag.column == column {
+            return CGFloat(drag.start) * Self.accountRowStep + drag.translation
+        }
+        return CGFloat(orderedAccounts(column).firstIndex { $0.id == id } ?? 0) * Self.accountRowStep
+    }
+
+    func updateAccountDrag(_ id: String, column: String, translation: CGFloat) {
+        guard canMutate, movable, translation.isFinite else { cancelAccountDrag(); return }
+        if !isDraggingAccount(id, column: column) { _ = beginAccountDrag(id, column: column) }
+        guard var drag = accountDrag else { return }
+        let position = min(CGFloat(drag.original.count - 1) * Self.accountRowStep, max(0, CGFloat(drag.start) * Self.accountRowStep + translation))
+        let index = Int((position / Self.accountRowStep).rounded())
+        drag.translation = position - CGFloat(drag.start) * Self.accountRowStep
+        drag.preview = drag.original.filter { $0 != id }
+        drag.preview.insert(id, at: index)
+        accountDrag = drag
+    }
+
+    func finishAccountDrag(_ id: String, column: String) {
+        guard let drag = accountDrag, drag.id == id, drag.column == column else { return }
+        _ = dropAccount([drag.token], onto: id, column: column)
+    }
+
+    func cancelAccountDrag() { accountDrag = nil }
+
     func dropAccount(_ tokens: [String], onto target: String, column: String) -> Bool {
         guard canMutate, movable, let drag = accountDrag, tokens == [drag.token], drag.column == column else { return false }
-        accountDrag = nil
         var ids = orderedAccounts(column).map(\.id)
+        accountDrag = nil
         guard let sourceIndex = ids.firstIndex(of: drag.id), let targetIndex = ids.firstIndex(of: target) else { return false }
-        if sourceIndex == targetIndex { return true }
         ids.remove(at: sourceIndex)
         ids.insert(drag.id, at: targetIndex)
         var next = accountOrder
@@ -739,6 +782,7 @@ final class Model: ObservableObject {
 
     func panelVisibility(_ visible: Bool) {
         panelOpen = visible
+        if !visible { cancelAccountDrag() }
         if visible { refresh() }
     }
 
@@ -765,13 +809,14 @@ final class Model: ObservableObject {
     }
 
     func refresh() {
-        guard !refreshing, !running, !sweeping else { return }
+        guard !refreshing, !running, !sweeping, accountDrag == nil else { return }
         refreshing = true
         var text = ""
         run(["accounts", "--json"], line: { text += $0 }) { [weak self] status, _ in
             guard let self else { return }
             refreshing = false
             guard status == 0, let data = text.data(using: .utf8), let list = try? JSONDecoder().decode([Account].self, from: data) else { return }
+            guard accountDrag == nil else { return }
             accounts = list
             recoveryBlocked = list.contains { $0.recoveryProblem != nil }
             if undoPending { markUndone() }
@@ -1358,27 +1403,41 @@ struct RowKey: PreferenceKey {
 
 struct ReorderableAccountRow: View {
     @EnvironmentObject private var model: Model
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let account: Account
     let column: String
-    @State private var targeted = false
+    @State private var hovered = false
+    @GestureState private var gestureActive = false
+    private var dragging: Bool { model.isDraggingAccount(account.id, column: column) }
+    private var selected: Bool { column == "to" ? model.to == account.id : model.from.contains(account.id) }
+    private var movement: Animation? { reduceMotion ? nil : .interactiveSpring(response: 0.28, dampingFraction: 0.84) }
 
     var body: some View {
-        HStack(spacing: 5) {
-            Image(systemName: "line.3.horizontal")
-                .font(.system(size: 11)).foregroundStyle(.secondary)
-                .frame(width: 16, height: 30).contentShape(Rectangle())
-                .help("Drag to reorder this column")
-                .accessibilityLabel("Reorder \(account.name) in \(column)")
-                .onDrag { NSItemProvider(object: model.beginAccountDrag(account.id, column: column) as NSString) }
-            Row(account: account, radio: column == "to", selected: column == "to" ? model.to == account.id : model.from.contains(account.id), muted: column == "from" && !model.canSource(account), tag: column == "from" ? model.sourceTag(account) : nil) {
-                if column == "to" { model.selectTarget(account.id) } else { model.toggle(account.id) }
-            }
+        Row(account: account, radio: column == "to", selected: selected, muted: column == "from" && !model.canSource(account), tag: column == "from" ? model.sourceTag(account) : nil) {
+            if column == "to" { model.selectTarget(account.id) } else { model.toggle(account.id) }
         }
-        .background(targeted ? Color.accentColor.opacity(0.15) : Color.clear, in: RoundedRectangle(cornerRadius: 5))
-        .dropDestination(for: String.self) { tokens, _ in
-            model.dropAccount(tokens, onto: account.id, column: column)
-        } isTargeted: { targeted = $0 }
-        .anchorPreference(key: RowKey.self, value: .bounds) { [column + "/" + account.id: $0] }
+        .padding(.horizontal, 10)
+        .background(dragging ? Color(white: 0.21) : selected ? Color.accentColor.opacity(0.09) : hovered ? Color.white.opacity(0.045) : Color.clear, in: RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(dragging ? Color.accentColor.opacity(0.45) : Color.white.opacity(selected ? 0.05 : 0), lineWidth: 1))
+        .contentShape(RoundedRectangle(cornerRadius: 9))
+        .scaleEffect(dragging && !reduceMotion ? 1.015 : 1)
+        .shadow(color: .black.opacity(dragging ? 0.28 : 0), radius: 9, y: 4)
+        .onHover { hovered = $0 }
+        .highPriorityGesture(DragGesture(minimumDistance: 5, coordinateSpace: .named("accounts-" + column))
+            .updating($gestureActive) { _, active, _ in active = true }
+            .onChanged { value in model.updateAccountDrag(account.id, column: column, translation: value.translation.height) }
+            .onEnded { value in
+                model.updateAccountDrag(account.id, column: column, translation: value.translation.height)
+                model.finishAccountDrag(account.id, column: column)
+            })
+        .onChange(of: gestureActive) { active in
+            if !active && dragging { model.cancelAccountDrag() }
+        }
+        .onExitCommand { model.cancelAccountDrag() }
+        .help("Click to select · Drag up or down to reorder\nAccount ID: \(account.account)\nOrganization ID: \(account.org)")
+        .offset(y: model.accountOffset(account.id, column: column))
+        .animation(dragging ? nil : movement, value: model.accountOffset(account.id, column: column))
+        .zIndex(dragging ? 1 : 0)
     }
 }
 
@@ -1397,7 +1456,7 @@ struct Row: View {
                 Image(systemName: selected ? (radio ? "largecircle.fill.circle" : "checkmark.circle.fill") : "circle")
                     .font(.system(size: 15))
                     .foregroundStyle(selected ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.tertiary))
-                VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 3) {
                     Text(account.name).font(.system(size: 13, weight: selected ? .semibold : .medium)).lineLimit(1).truncationMode(.middle)
                     HStack(spacing: 6) {
                         Text(account.plan).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
@@ -1406,7 +1465,7 @@ struct Row: View {
                 }
                 Spacer(minLength: 0)
             }
-            .frame(height: 34)
+            .frame(height: 46)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1569,7 +1628,7 @@ struct Panel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Text("Claude Transplant · Nick’s fork").font(.system(.title3, design: .rounded, weight: .semibold))
+                Text("Claude Transplant").font(.system(.title3, design: .rounded, weight: .semibold))
                 if let label = model.identityLabel { Text(label).font(.caption).foregroundStyle(.secondary) }
                 Spacer()
                 Button(action: { model.reset() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
@@ -1646,7 +1705,7 @@ struct Panel: View {
             board
         } else {
             ScrollView(.vertical) { board }
-                .frame(height: CGFloat(Panel.visibleRows * 34 + 18))
+                .frame(height: CGFloat(Panel.visibleRows) * Model.accountRowStep + 18)
         }
     }
 
@@ -1697,25 +1756,27 @@ struct Panel: View {
         }
     }
 
-    private var board: some View {
-        let width = columnWidth
-        return HStack(alignment: .top, spacing: 0) {
-            column("From") {
-                ForEach(model.orderedAccounts("from")) { account in
-                    ReorderableAccountRow(account: account, column: "from")
+    private func accountColumn(_ side: String) -> some View {
+        column(side == "from" ? "From" : "To") {
+            ZStack(alignment: .topLeading) {
+                ForEach(model.visibleAccounts) { account in
+                    ReorderableAccountRow(account: account, column: side)
                 }
             }
-            .frame(width: width, alignment: .leading)
-            Spacer(minLength: Panel.gap)
-            column("To") {
-                ForEach(model.orderedAccounts("to")) { account in
-                    ReorderableAccountRow(account: account, column: "to")
-                }
-            }
-            .frame(width: width, alignment: .leading)
+            .frame(height: max(0, CGFloat(model.visibleAccounts.count) * Model.accountRowStep - 4), alignment: .top)
+            .coordinateSpace(name: "accounts-" + side)
         }
-        .overlayPreferenceValue(RowKey.self) { anchors in
-            Arrows(anchors: anchors)
+        .frame(width: columnWidth, alignment: .leading)
+    }
+
+    private var board: some View {
+        HStack(alignment: .top, spacing: 0) {
+            accountColumn("from")
+            Image(systemName: "arrow.right")
+                .font(.system(size: 15, weight: .medium)).foregroundStyle(.tertiary)
+                .frame(width: Panel.gap).padding(.top, 35)
+                .accessibilityHidden(true)
+            accountColumn("to")
         }
     }
 
@@ -1728,10 +1789,10 @@ struct Panel: View {
             }
             return max((account.name as NSString).size(withAttributes: name).width, (account.plan as NSString).size(withAttributes: plan).width + tags)
         }.max() ?? 0
-        return min(300, max(180, 65 + ceil(widest)))
+        return min(300, max(190, 64 + ceil(widest)))
     }
 
-    static let gap: CGFloat = 150
+    static let gap: CGFloat = 44
     static let visibleRows = 10
 
     private var panelWidth: CGFloat {

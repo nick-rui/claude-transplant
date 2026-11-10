@@ -12434,6 +12434,30 @@ struct AccountOrderingChecks {
         let original = rows.map(\.id)
         let from = model.from, to = model.to
         model.selectedSessions = ["selected-session"]
+        let preview = Model(demo: rows, orderFile: file)
+        preview.updateAccountDrag(rows[0].id, column: "from", translation: 24)
+        precondition(preview.orderedAccounts("from").map(\.id) == original)
+        preview.updateAccountDrag(rows[0].id, column: "from", translation: 80)
+        precondition(preview.orderedAccounts("from").map(\.id) == [original[1], original[2], original[0], original[3]])
+        precondition(preview.accountOffset(rows[0].id, column: "from") == 80)
+        precondition(preview.accountOffset(rows[1].id, column: "from") == 0)
+        precondition(preview.orderedAccounts("to").map(\.id) == original)
+        precondition(!FileManager.default.fileExists(atPath: file.path))
+        precondition(preview.from == from && preview.to == to)
+        guard let draggingImage = Snapshot.data(preview) else { fatalError("Missing drag preview") }
+        try draggingImage.write(to: URL(fileURLWithPath: CommandLine.arguments[2] + ".drag.png"))
+        preview.updateAccountDrag(rows[0].id, column: "from", translation: 24)
+        precondition(preview.orderedAccounts("from").map(\.id) == original)
+        preview.updateAccountDrag(rows[0].id, column: "from", translation: 5000)
+        precondition(preview.accountOffset(rows[0].id, column: "from") == 150)
+        preview.cancelAccountDrag()
+        precondition(preview.orderedAccounts("from").map(\.id) == original)
+        precondition(!FileManager.default.fileExists(atPath: file.path))
+        preview.updateAccountDrag(rows[0].id, column: "from", translation: 80)
+        preview.finishAccountDrag(rows[0].id, column: "from")
+        precondition(!preview.isDraggingAccount(rows[0].id, column: "from"))
+        precondition(Model(demo: rows, orderFile: file).orderedAccounts("from").map(\.id) == [original[1], original[2], original[0], original[3]])
+        try FileManager.default.removeItem(at: file)
         let token = model.beginAccountDrag(rows[0].id, column: "from")
         precondition(!model.dropAccount([token], onto: rows[2].id, column: "to"))
         precondition(!model.dropAccount(["external text"], onto: rows[2].id, column: "from"))
@@ -12455,6 +12479,7 @@ struct AccountOrderingChecks {
         restored.running = true
         precondition(!restored.dropAccount([blocked], onto: rows[0].id, column: "from"))
         restored.running = false
+        restored.cancelAccountDrag()
         guard let image = Snapshot.data(restored) else { fatalError("Missing account order screenshot") }
         try image.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
         try Data("invalid".utf8).write(to: file)
