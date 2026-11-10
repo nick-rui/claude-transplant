@@ -12419,3 +12419,54 @@ test('account display aliases preserve identity and ignore malformed labels', as
   await writeFile(path.join(h.paths.state, 'account-labels.json'), '{broken')
   assert.equal((await accounts(h.paths, [])).find(a => a.account === h.acct.P).label, original.label)
 })
+
+
+test('Swift account ordering persists independent columns without changing transfer selections', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-account-order-'))
+  const source = await swiftFixtureSource(false) + String.raw`
+@main
+struct AccountOrderingChecks {
+    @MainActor static func main() throws {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        let file = URL(fileURLWithPath: CommandLine.arguments[1])
+        let rows = Demo.accounts
+        let model = Model(demo: rows, orderFile: file)
+        let original = rows.map(\.id)
+        let from = model.from, to = model.to
+        model.selectedSessions = ["selected-session"]
+        let token = model.beginAccountDrag(rows[0].id, column: "from")
+        precondition(!model.dropAccount([token], onto: rows[2].id, column: "to"))
+        precondition(!model.dropAccount(["external text"], onto: rows[2].id, column: "from"))
+        precondition(model.dropAccount([token], onto: rows[2].id, column: "from"))
+        let reordered = [original[1], original[2], original[0], original[3]]
+        precondition(model.orderedAccounts("from").map(\.id) == reordered)
+        precondition(model.orderedAccounts("to").map(\.id) == original)
+        precondition(model.from == from && model.to == to && model.selectedSessions == ["selected-session"])
+        precondition(!model.dropAccount([token], onto: rows[3].id, column: "from"))
+        let right = model.beginAccountDrag(rows[3].id, column: "to")
+        precondition(model.dropAccount([right], onto: rows[0].id, column: "to"))
+        let restored = Model(demo: rows.reversed(), orderFile: file)
+        precondition(restored.orderedAccounts("from").map(\.id) == reordered)
+        precondition(restored.orderedAccounts("to").map(\.id) == [original[3], original[0], original[1], original[2]])
+        let extra = Account(account: "new", org: "new", email: "new@example.com", orgName: "New", label: "New", active: false, signedIn: false, activeAt: 0, pending: nil, pendingFailures: nil, sessions: 1)
+        restored.accounts.insert(extra, at: 0)
+        precondition(restored.orderedAccounts("from").last?.id == extra.id)
+        let blocked = restored.beginAccountDrag(extra.id, column: "from")
+        restored.running = true
+        precondition(!restored.dropAccount([blocked], onto: rows[0].id, column: "from"))
+        restored.running = false
+        guard let image = Snapshot.data(restored) else { fatalError("Missing account order screenshot") }
+        try image.write(to: URL(fileURLWithPath: CommandLine.arguments[2]))
+        try Data("invalid".utf8).write(to: file)
+        precondition(Model(demo: rows, orderFile: file).orderedAccounts("from").map(\.id) == original)
+        print("Account ordering passed")
+    }
+}
+`
+  const file = path.join(root, 'ordering.swift'), binary = path.join(root, 'ordering'), png = path.join(root, 'ordering.png')
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [path.join(root, 'account-order.json'), png], { timeout: 15_000 })
+  assert.match(stdout, /Account ordering passed/)
+  t.diagnostic('Ordering screenshot: ' + png)
+})

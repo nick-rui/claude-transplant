@@ -321,6 +321,9 @@ final class Model: ObservableObject {
     @Published var to: String?
     @Published var excluded: Set<String> = []
     @Published var lanes: [String: String] = [:]
+    @Published private var accountOrder: [String: [String]] = [:]
+    private let orderFile: URL?
+    private var accountDrag: (token: String, id: String, column: String)?
     @Published var lines: [(String, String)] = []
     @Published var detailsExpanded = false
     @Published var note = ""
@@ -382,8 +385,10 @@ final class Model: ObservableObject {
     init(snapshot: Bool = false, config supplied: Config? = nil) {
         self.snapshot = snapshot
         demo = false
+        orderFile = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant/account-order.json")
         let file = Bundle.main.url(forResource: "menubar", withExtension: "json") ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/claude-transplant/menubar.json")
         config = supplied ?? (try? Data(contentsOf: file)).flatMap { try? JSONDecoder().decode(Config.self, from: $0) }
+        loadAccountOrder()
         if snapshot {
             guard let config, let text = Model.capture(node(config.node), config.arguments(["accounts", "--json"])), let decoded = try? JSONDecoder().decode([Account].self, from: Data(text.utf8)) else { snapshotFailed = true; return }
             accounts = decoded
@@ -405,10 +410,12 @@ final class Model: ObservableObject {
         }
     }
 
-    init(demo accounts: [Account]) {
+    init(demo accounts: [Account], orderFile: URL? = nil) {
         snapshot = true
         demo = true
         config = nil
+        self.orderFile = orderFile
+        loadAccountOrder()
         skipRestartWarning = false
         self.accounts = accounts
         settle()
@@ -418,6 +425,49 @@ final class Model: ObservableObject {
     var tooltip: String { running ? moveProgress.detail : "Claude Transplant" }
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var visibleAccounts: [Account] { accounts.filter { listed($0) || $0.id == to } }
+    private func loadAccountOrder() {
+        guard let orderFile, let data = try? Data(contentsOf: orderFile), let saved = try? JSONDecoder().decode([String: [String]].self, from: data) else { return }
+        accountOrder = saved
+    }
+
+    func orderedAccounts(_ column: String) -> [Account] {
+        let saved = accountOrder[column] ?? []
+        return visibleAccounts.enumerated().sorted { left, right in
+            let l = saved.firstIndex(of: left.element.id) ?? saved.count + left.offset
+            let r = saved.firstIndex(of: right.element.id) ?? saved.count + right.offset
+            return l < r
+        }.map(\.element)
+    }
+
+    func beginAccountDrag(_ id: String, column: String) -> String {
+        let token = UUID().uuidString
+        accountDrag = canMutate && movable && ["from", "to"].contains(column) && visibleAccounts.contains(where: { $0.id == id }) ? (token, id, column) : nil
+        return token
+    }
+
+    func dropAccount(_ tokens: [String], onto target: String, column: String) -> Bool {
+        guard canMutate, movable, let drag = accountDrag, tokens == [drag.token], drag.column == column else { return false }
+        accountDrag = nil
+        var ids = orderedAccounts(column).map(\.id)
+        guard let sourceIndex = ids.firstIndex(of: drag.id), let targetIndex = ids.firstIndex(of: target) else { return false }
+        if sourceIndex == targetIndex { return true }
+        ids.remove(at: sourceIndex)
+        ids.insert(drag.id, at: targetIndex)
+        var next = accountOrder
+        next[column] = ids + (accountOrder[column] ?? []).filter { !ids.contains($0) }
+        if let orderFile {
+            do {
+                try FileManager.default.createDirectory(at: orderFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try JSONEncoder().encode(next).write(to: orderFile, options: .atomic)
+            } catch {
+                note = "Could not save account order: \(error.localizedDescription)"
+                return false
+            }
+        }
+        accountOrder = next
+        return true
+    }
+
     private func listed(_ account: Account) -> Bool { account.active == true || account.confirmed == true || (account.confirmed == nil && (account.email != nil || account.sessions != 0)) || (account.sessions ?? 0) > 0 || account.pending != nil }
     private var latestReceipt: String? { accounts.lazy.compactMap(\.receipt).first }
     private func signInNeeded(_ account: Account) -> Bool { account.pendingAction == "sign-in" && account.identityState != "unknown" }
@@ -1306,6 +1356,32 @@ struct RowKey: PreferenceKey {
     }
 }
 
+struct ReorderableAccountRow: View {
+    @EnvironmentObject private var model: Model
+    let account: Account
+    let column: String
+    @State private var targeted = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "line.3.horizontal")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+                .frame(width: 16, height: 30).contentShape(Rectangle())
+                .help("Drag to reorder this column")
+                .accessibilityLabel("Reorder \(account.name) in \(column)")
+                .onDrag { NSItemProvider(object: model.beginAccountDrag(account.id, column: column) as NSString) }
+            Row(account: account, radio: column == "to", selected: column == "to" ? model.to == account.id : model.from.contains(account.id), muted: column == "from" && !model.canSource(account), tag: column == "from" ? model.sourceTag(account) : nil) {
+                if column == "to" { model.selectTarget(account.id) } else { model.toggle(account.id) }
+            }
+        }
+        .background(targeted ? Color.accentColor.opacity(0.15) : Color.clear, in: RoundedRectangle(cornerRadius: 5))
+        .dropDestination(for: String.self) { tokens, _ in
+            model.dropAccount(tokens, onto: account.id, column: column)
+        } isTargeted: { targeted = $0 }
+        .anchorPreference(key: RowKey.self, value: .bounds) { [column + "/" + account.id: $0] }
+    }
+}
+
 struct Row: View {
     let account: Account
     let radio: Bool
@@ -1336,7 +1412,6 @@ struct Row: View {
         .buttonStyle(.plain)
         .opacity(muted ? 0.35 : 1)
         .help("Account ID: \(account.account)\nOrganization ID: \(account.org)\nNames may be local labels. Stored history does not prove current membership.")
-        .anchorPreference(key: RowKey.self, value: .bounds) { [(radio ? "to/" : "from/") + account.id: $0] }
     }
 }
 
@@ -1626,15 +1701,15 @@ struct Panel: View {
         let width = columnWidth
         return HStack(alignment: .top, spacing: 0) {
             column("From") {
-                ForEach(model.visibleAccounts) { account in
-                    Row(account: account, radio: false, selected: model.from.contains(account.id), muted: !model.canSource(account), tag: model.sourceTag(account)) { model.toggle(account.id) }
+                ForEach(model.orderedAccounts("from")) { account in
+                    ReorderableAccountRow(account: account, column: "from")
                 }
             }
             .frame(width: width, alignment: .leading)
             Spacer(minLength: Panel.gap)
             column("To") {
-                ForEach(model.visibleAccounts) { account in
-                    Row(account: account, radio: true, selected: model.to == account.id, muted: false) { model.selectTarget(account.id) }
+                ForEach(model.orderedAccounts("to")) { account in
+                    ReorderableAccountRow(account: account, column: "to")
                 }
             }
             .frame(width: width, alignment: .leading)
@@ -1653,7 +1728,7 @@ struct Panel: View {
             }
             return max((account.name as NSString).size(withAttributes: name).width, (account.plan as NSString).size(withAttributes: plan).width + tags)
         }.max() ?? 0
-        return min(300, max(180, 44 + ceil(widest)))
+        return min(300, max(180, 65 + ceil(widest)))
     }
 
     static let gap: CGFloat = 150

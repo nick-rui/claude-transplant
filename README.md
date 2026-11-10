@@ -10,7 +10,7 @@ With Node 22 or newer and the Xcode command-line tools installed, run this from 
 node transplant.js menubar
 ```
 
-This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel says **Nick's fork**, with version **4.2.1-nick.2**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
+This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel says **Nick's fork**, with version **4.2.1-nick.3**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
 
 ## Choose what to move
 
@@ -19,13 +19,15 @@ This replaces the installed menu-bar app and retains its existing receipts, back
 3. Check individual sessions, or explicitly choose Select shown. No sessions are selected automatically.
 4. Review the selected titles and destination, then move. The existing restart warning appears separately when needed.
 
+Drag the handle beside an account to reorder it within either column. From and To have independent orders, saved across restarts in `~/Library/Application Support/claude-transplant/account-order.json`. Reordering does not select accounts or move sessions. New accounts appear after saved entries.
+
 Related forks, shared session records, and scheduled-task sessions are selected as a group. The selected count includes related sessions outside the search/date filter. The backend rejects incomplete groups, disappeared sessions, unreadable source metadata, and attempts to widen the selection after a restart plan.
 
 The picker moves **local Code sessions only**. Cloud copies are kept. Transcripts and project files remain in place; source sidebar records are backed up using the existing transfer engine. Undo and interrupted-move recovery use the original engine. Running sessions may still require a restart of all of Claude Desktop, including unrelated work.
 
 Empty account/org folders without saved login evidence are hidden from the menu. This is a local-data filter, not a live organization-membership lookup.
 
-Friendly account labels can be stored locally in `~/Library/Application Support/claude-transplant/account-labels.json`, keyed by `ACCOUNT_UUID/ORG_UUID`, with optional `name` and `org` strings. These are display aliases, not verified membership or changes to Claude's login. Hover an account row to see both full IDs. Keep this personal file outside the repository.
+Friendly account labels can be stored locally in `~/Library/Application Support/claude-transplant/account-labels.json`, keyed by `ACCOUNT_UUID/ORG_UUID`, with optional `name` and `org` strings. These are display aliases, not verified membership or changes to Claude's login. Hover an account row to see both full IDs. Keep this personal file outside the repository. Both `account-labels.json*` and `account-order.json*` are also gitignored to protect accidental copies into the checkout.
 
 Desktop-created SSH sessions with a local transcript mirror are eligible too. Their SSH connection metadata is retained; remote files, credentials, and running processes are not migrated. Sessions created solely in a remote terminal are not automatically imported.
 
