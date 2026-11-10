@@ -10,11 +10,11 @@ With Node 22 or newer and the Xcode command-line tools installed, run this from 
 node transplant.js menubar
 ```
 
-This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel shows version **4.2.1-nick.4**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
+This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel shows version **4.2.1-nick.5**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
 
 ## Choose what to move
 
-1. Select the source account/organization and destination account/organization.
+1. Select the source account/organization and destination account/organization. Either side can be empty: click a selected destination again to clear it, or uncheck all sources. Choosing a destination never fills an empty source selection. The Move button appears only when sources, a destination, and sessions are selected.
 2. Search by session title or project. The initial filter shows the last 30 days; choose 7 days or All dates as needed.
 3. Check individual sessions, or explicitly choose Select shown. No sessions are selected automatically.
 4. Review the selected titles and destination, then move. The existing restart warning appears separately when needed.

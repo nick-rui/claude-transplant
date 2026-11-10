@@ -9942,9 +9942,12 @@ struct WordingChecks {
             restartDialogs = []
             let model = Model(demo: fixture.accounts)
             if model.pendingAccounts.isEmpty, let target = fixture.operation.firstIndex(of: "--to"), target + 1 < fixture.operation.count {
-                model.selectTarget(fixture.operation[target + 1].replacingOccurrences(of: " ", with: "/"))
+                let destination = fixture.operation[target + 1].replacingOccurrences(of: " ", with: "/")
+                if model.to != destination { model.selectTarget(destination) }
                 let selected = Set(fixture.operation.indices.filter { fixture.operation[$0] == "--from" && $0 + 1 < fixture.operation.count }.map { fixture.operation[$0 + 1].replacingOccurrences(of: " ", with: "/") })
                 for id in model.from.subtracting(selected) { model.toggle(id) }
+                for id in selected.subtracting(model.from) { model.toggle(id) }
+                model.checkSelect()
             }
             model.checkOperation(fixture.operation)
             var text: String
@@ -10288,10 +10291,11 @@ struct StateChecks {
         for id in Array(picker.from) { picker.toggle(id) }
         precondition(picker.from.isEmpty)
         picker.selectTarget(Demo.accounts[2].id)
-        precondition(picker.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[2].id]))
+        precondition(picker.from.isEmpty && picker.to == nil)
+        picker.toggle(Demo.accounts[0].id)
         picker.toggle(Demo.accounts[0].id)
         picker.selectTarget(Demo.accounts[3].id)
-        precondition(!picker.from.contains(Demo.accounts[0].id))
+        precondition(picker.from.isEmpty && picker.to == Demo.accounts[3].id)
         picker.reset()
         precondition(picker.from.isEmpty && picker.to == nil && !picker.ready && picker.note.isEmpty)
         precondition(requests.count == 1 && requests[0].0 == ["accounts", "--json"])
@@ -10304,7 +10308,7 @@ struct StateChecks {
         precondition(picker.from == [Demo.accounts[0].id] && picker.ready)
         picker.reset()
         picker.selectTarget(Demo.accounts[3].id)
-        precondition(picker.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[3].id]))
+        precondition(picker.from.isEmpty && picker.primaryTitle == nil)
         picker.begin()
         picker.reset()
         precondition(picker.running && picker.to == Demo.accounts[3].id)
@@ -10566,7 +10570,7 @@ struct StateChecks {
                 sweepReply(item, #"{"swept":true,"ok":true,"complete":true,"issues":0}"#)
                 precondition(item.restartAvailable && item.symbol == "info.circle")
                 item.selectTarget("work/personal")
-                precondition(item.primaryTitle == "Move 1 session")
+                precondition(item.primaryTitle == nil)
                 precondition(!item.restartAvailable && item.symbol == "arrow.left.arrow.right")
             } else {
                 precondition(item.displaySummary.contains("will retry automatically") && item.primaryTitle == nil)
@@ -10872,12 +10876,12 @@ struct StateChecks {
         precondition(background.visibleCompletion?.summary == done && background.visibleCompletion?.detail == "History verified" && background.screen == .moved)
         precondition(background.from.isEmpty && background.to == nil && background.symbol == "arrow.left.arrow.right")
         background.selectTarget("home/personal")
-        precondition(background.primaryTitle == "Move 1 session" && background.visibleCompletion?.summary == done)
+        precondition(background.primaryTitle == nil && background.visibleCompletion?.summary == done)
         background.panelVisibility(false)
         background.panelVisibility(true)
         requests.last!.1(recordedAt("2026-10-30T21-00-00-000"))
         requests.last!.2(0, "")
-        precondition(background.visibleCompletion?.summary == done && background.primaryTitle == "Move 1 session")
+        precondition(background.visibleCompletion?.summary == done && background.primaryTitle == nil)
         precondition(notices == ["499 moved. Checking the remaining source conversations.", done])
         let relaunched = recordedModel("2026-10-30T21-00-00-000")
         precondition(relaunched.visibleCompletion?.summary == done && relaunched.links.map(\.title) == ["Undo last move"])
@@ -10928,7 +10932,8 @@ struct StateChecks {
         notices = []
         let leaving = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
         precondition(leaving.primaryTitle == "Move 1 session" && leaving.movable)
-        leaving.selectTarget("home/personal")
+        if leaving.to != "home/personal" { leaving.selectTarget("home/personal") }
+        for id in ["work/company", "work/personal"] where !leaving.from.contains(id) { leaving.toggle(id) }
         leaving.skipRestartWarning = true
         let leaveTokens = leaving.selectedSessions.sorted()
         leaving.primary()
@@ -10962,7 +10967,7 @@ struct StateChecks {
         let crowded = Model(demo: Demo.accounts + [ghost])
         precondition(crowded.visibleAccounts.map(\.id) == Demo.accounts.map(\.id))
         crowded.selectTarget(Demo.accounts[2].id)
-        precondition(crowded.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[2].id]))
+        precondition(crowded.from == Set(Demo.accounts.map(\.id)).subtracting([Demo.accounts[2].id, Demo.accounts[3].id]))
         crowded.selectTarget(ghost.id)
         precondition(crowded.visibleAccounts.last?.id == ghost.id)
         let activeGhost = Account(account: "ghost", org: "ghost-org", email: nil, orgName: nil, label: "ghost · ghost-or", active: true, signedIn: true, activeAt: nil, pending: nil, pendingFailures: nil, sessions: 0)
@@ -12309,7 +12314,7 @@ struct SelectivePickerChecks {
         let model = Model(demo: [source, target, ghost])
         precondition(!model.ready && model.selectedSessions.isEmpty)
         precondition(!model.visibleAccounts.contains { $0.id == ghost.id })
-        model.selectTarget(target.id)
+        if model.to != target.id { model.selectTarget(target.id) }
         if !model.from.contains(source.id) { model.toggle(source.id) }
         let now = Date().timeIntervalSince1970 * 1000
         let first = SelectableSession(token: "source/personal/local_one", title: "EM continuation", accountLabel: source.label, project: "em-olmo", cwd: "/code/em-olmo", activeAt: now, archived: false, running: true, related: ["source/personal/local_one", "source/personal/local_two"])
@@ -12494,4 +12499,56 @@ struct AccountOrderingChecks {
   const { stdout } = await promisify(execFile)(binary, [path.join(root, 'account-order.json'), png], { timeout: 15_000 })
   assert.match(stdout, /Account ordering passed/)
   t.diagnostic('Ordering screenshot: ' + png)
+})
+
+
+test('Swift empty source and destination selections stay empty and hide the transfer action', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-optional-selection-'))
+  const source = await swiftFixtureSource(false) + String.raw`
+@main
+struct OptionalSelectionChecks {
+    @MainActor static func main() {
+        let model = Model(demo: Demo.accounts)
+        for id in model.from { model.toggle(id) }
+        precondition(model.from.isEmpty && model.primaryTitle == nil)
+        let target = model.to!
+        model.selectTarget(target)
+        precondition(model.to == nil && model.from.isEmpty && model.primaryTitle == nil)
+        model.selectTarget(target)
+        precondition(model.to == target && model.from.isEmpty && model.primaryTitle == nil)
+        let source = Demo.accounts.first { $0.id != target }!
+        model.toggle(source.id)
+        precondition(model.from == [source.id] && model.primaryTitle == nil)
+        let row = SelectableSession(token: "optional-session", title: "Selected session", accountLabel: source.label, project: "fixture", cwd: "/fixture", activeAt: 100, archived: false, running: false, related: ["optional-session"])
+        model.sessionRows = [row]
+        model.toggleSession(row)
+        precondition(model.primaryTitle == "Move 1 session")
+        model.selectTarget(target)
+        precondition(model.to == nil && model.from == [source.id] && model.selectedSessions == [row.token] && model.primaryTitle == nil)
+        model.selectTarget(target)
+        precondition(model.primaryTitle == "Move 1 session")
+        model.toggle(source.id)
+        precondition(model.from.isEmpty && model.selectedSessions.isEmpty && model.primaryTitle == nil)
+        model.selectTarget(target)
+        precondition(model.to == nil && model.primaryTitle == nil)
+        requests = []
+        model.refresh()
+        let reply = requests.last!
+        reply.1(#"[{"account":"work","org":"acme","email":"you@work.com","orgName":"Acme Inc.","label":"Work","active":true,"signedIn":true,"sessions":3},{"account":"work2","org":"northwind","email":"you@work2.com","orgName":"Northwind","label":"Other","active":false,"sessions":2}]"#)
+        reply.2(0, "")
+        precondition(model.from.isEmpty && model.to == nil && model.primaryTitle == nil)
+        model.selectTarget("work2/northwind")
+        precondition(model.from.isEmpty && model.primaryTitle == nil)
+        model.reset()
+        model.selectTarget("work/acme")
+        precondition(model.from.isEmpty && model.to == "work/acme" && model.primaryTitle == nil)
+        print("Optional selection passed")
+    }
+}
+`
+  const file = path.join(root, 'optional.swift'), binary = path.join(root, 'optional')
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [], { timeout: 15_000 })
+  assert.match(stdout, /Optional selection passed/)
 })

@@ -730,14 +730,15 @@ final class Model: ObservableObject {
 
     func selectTarget(_ id: String) {
         guard !running else { return }
-        if from.isEmpty { excluded = [] }
+        let selectedSources = from
         clearResult()
         if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
             lanes[vacated] = id
             lanes[taken] = old
         }
-        to = id
+        to = to == id ? nil : id
         targetChosen = true
+        excluded = Set(accounts.map(\.id)).subtracting(selectedSources)
         settle()
     }
 
