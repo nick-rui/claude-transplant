@@ -1,3 +1,54 @@
+# Claude Transplant — Nick's fork
+
+This private fork adds individual session selection to [Vitaliy Hayda's Claude Transplant](https://github.com/vitaliyhayda/claude-transplant), based on v4.2.1 (`ad7458c`). The upstream MIT license is preserved.
+
+## Install this version
+
+With Node 22 or newer and the Xcode command-line tools installed, run this from the checkout:
+
+```sh
+node transplant.js menubar
+```
+
+This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel says **Nick's fork**, with version **4.2.1-nick.1**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
+
+## Choose what to move
+
+1. Select the source account/organization and destination account/organization.
+2. Search by session title or project. The initial filter shows the last 30 days; choose 7 days or All dates as needed.
+3. Check individual sessions, or explicitly choose Select shown. No sessions are selected automatically.
+4. Review the selected titles and destination, then move. The existing restart warning appears separately when needed.
+
+Related forks, shared session records, and scheduled-task sessions are selected as a group. The selected count includes related sessions outside the search/date filter. The backend rejects incomplete groups, disappeared sessions, unreadable source metadata, and attempts to widen the selection after a restart plan.
+
+The picker moves **local Code sessions only**. Cloud copies are kept. Transcripts and project files remain in place; source sidebar records are backed up using the existing transfer engine. Undo and interrupted-move recovery use the original engine. Running sessions may still require a restart of all of Claude Desktop, including unrelated work.
+
+Empty account/org folders without saved login evidence are hidden from the menu. This is a local-data filter, not a live organization-membership lookup.
+
+For scripts, list opaque selection tokens and pass one or more exact tokens:
+
+```sh
+node transplant.js sessions --from 'ACCOUNT_UUID ORG_UUID' --json
+node transplant.js --from 'ACCOUNT_UUID ORG_UUID' --to 'OTHER_ACCOUNT_UUID OTHER_ORG_UUID' --session 'ACCOUNT_UUID/ORG_UUID/local_SESSION_UUID' --dry-run --json
+```
+
+Remove `--dry-run` to perform the selected move. Repeat `--session` for multiple sessions. `--session` cannot be combined with `--cloud`. The original account-wide CLI remains available when `--session` is omitted.
+
+## Validation
+
+Use a dedicated temporary directory outside the checkout, as described in CONTRIBUTING.md:
+
+```sh
+TMPDIR=/path/to/dedicated-test-directory npm_config_offline=true npm_config_update_notifier=false npm test
+swiftc -typecheck -parse-as-library menubar.swift
+```
+
+Tests use synthetic homes and mock app control and cloud operations. Selective-transfer tests cover untouched unselected records, undo, dry runs, linked groups, restart selection binding, dependency changes, and the Swift picker. No real user sessions are transferred by the tests.
+
+---
+
+The original upstream documentation follows. Its npm installation commands install the upstream app, not this fork.
+
 <h1 align="center">claude-transplant</h1>
 
 <h3 align="center">Move Claude Code history between accounts in Claude Desktop. Menubar or CLI.</h3>

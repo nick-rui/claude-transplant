@@ -11,6 +11,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
+import { selectableSessions, selectSessions } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
@@ -9797,7 +9798,7 @@ function wordingFixtures() {
     { name: '02-held', screen: 'needs a restart', accounts: held, contains: ['259 sessions moved\n102 more need Claude to restart.'], primary: 'Restart Claude and move 102' },
     { name: '03-restart-dialog', plan, dialog: true, contains: ['Restart Claude to move 102 more sessions?', 'These open chats will stop:'], primary: 'Restart and move' },
     { name: '04-same-login', screen: 'moved', accounts: pending(1, 'cloud', 1), contains: ['361 sessions moved\n1 old copy needs checking', 'Cleanup will retry automatically.'], primary: null },
-    { name: '05-other-login', screen: 'needs a sign-in', accounts: pending(2, 'cloud', 3), contains: ['361 sessions moved\n3 old copies need checking', 'Sign Claude in as home@example.test'], primary: 'Leave old copies and move' },
+    { name: '05-other-login', screen: 'needs a sign-in', accounts: pending(2, 'cloud', 3), contains: ['361 sessions moved\n3 old copies need checking', 'Sign Claude in as home@example.test'], primary: 'Move 1 session' },
     { name: '06-clearing', screen: 'moving', accounts: pending(1, 'cloud', 1, null, null, 1), operation: ['finish', '--json'], event: { stage: 'cloud', live: true, text: '0/1', total: 1, completed: 0, moved: 361, sourceId: 'work/personal', sourceLabel: base[1].label }, contains: ['0%'], primary: null },
     { name: '08-unproven', screen: 'moved', event: { done: true, ok: true, complete: true, moved: 361, destinationLabel: base[0].label, summary: { moved: 361, notMoved: [], groups: [], attention: [], kept: [{ id: 'cse_research', title: 'Research conversation', error: `not proven to be on this Mac, kept in ${base[1].label}` }] } }, contains: ['Done. 361 sessions are now in', `Research conversation | cse_rese | not proven to be on this Mac, kept in ${base[1].label}`], primary: null, expanded: true },
     { name: '09-open-chats', screen: 'needs a restart', accounts: pending(1, 'local', 2, null, 'worker'), contains: ['359 sessions moved\n2 open chats move after they go idle'], primary: 'Restart Claude and move 2' },
@@ -9835,15 +9836,16 @@ function wordingFixtures() {
     { name: '48-parser-limit', screen: "can't move", accounts: pending(0, 'cloud', 1, 'CLOUD_PARSER_LIMIT'), contains: ["history reader's limit"], primary: null, keep: true },
     { name: '49-local-partial', screen: "can't move", accounts: partial, contains: ['272 sessions moved\n3 sessions remain', 'Keep moved sessions or undo this move.'], primary: null, keep: true },
     { name: '50-limit-and-sign-in', screen: 'needs a sign-in', accounts: limitAndSignIn, contains: ['361 sessions moved\n3 old copies need checking', 'exceeds the history limit'], primary: null },
-    { name: '51-recorded-result', screen: 'moved', accounts: recorded, contains: [`Done. 499 sessions are now in ${base[1].label}.\nHistory verified`], primary: 'Move' },
+    { name: '51-recorded-result', screen: 'moved', accounts: recorded, contains: [`Done. 499 sessions are now in ${base[1].label}.\nHistory verified`], primary: 'Move 1 session' },
     { name: '52-waiting-for-claude', accounts: starting, contains: ['361 sessions moved\nWaiting for Claude.'], primary: null },
     { name: '53-other-login-and-unfinished-local', screen: 'needs a sign-in', accounts: unfinished, contains: ['272 sessions moved\n3 old copies need checking'], primary: null }
   ]
   return rows.map(row => ({ ...row, accounts: row.accounts ?? base, operation: row.operation ?? ['--from', 'work personal', '--to', 'work company', '--cloud', '--json'], event: row.event ? JSON.stringify(row.event) : null }))
 }
 
-async function swiftFixtureSource() {
+async function swiftFixtureSource(selectFixtureSessions = true) {
   let source = (await readFile(path.join(here, 'menubar.swift'), 'utf8')).split('@main\nstruct TransplantApp: App {')[0]
+  if (selectFixtureSessions) source = source.replace('        from = !movable ? Set(pendingAccounts.filter(canSource).map(\\.id)) : selectionComplete ? [] : Set(visibleAccounts.filter(canSource).map(\\.id)).subtracting(excluded)', '$&\n        checkSelect()')
   const start = source.indexOf('    private func run(_ args: [String]')
   const end = source.indexOf('\nstruct RowKey: PreferenceKey', start)
   assert.ok(start > 0 && end > start)
@@ -9867,7 +9869,7 @@ async function swiftFixtureSource() {
     }
 
 ` + source.slice(promptEnd)
-  return source.replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
+  return source.replace('guard alert.runModal() == .alertFirstButtonReturn else { return }', 'guard selectionDialogResponse == .alertFirstButtonReturn else { return }').replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
     .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)')
     .replace('DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in', 'scheduleBadgeReset { [weak self] in')
     .replace('if demo || snapshot { return }', 'notices.append(title)\n        if demo || snapshot { return }')
@@ -9888,10 +9890,17 @@ async function swiftFixtureSource() {
 @MainActor func scheduleBadgeReset(_ action: @escaping () -> Void) { badgeResets.append(action) }
 @MainActor var restartDialogs: [RestartPrompt] = []
 @MainActor var restartDialogResponse: (NSApplication.ModalResponse, Bool) = (.alertThirdButtonReturn, false)
+@MainActor var selectionDialogResponse: NSApplication.ModalResponse = .alertFirstButtonReturn
 @MainActor var notices: [String] = []
 @MainActor var fetches: [(String?) -> Void] = []
 @MainActor var launches: [(Process, (Int32, String) -> Void)] = []
 extension Model {
+    func checkSelect() {
+        guard let source = accounts.first(where: { from.contains($0.id) }) else { return }
+        let token = source.id + "/local_fixture"
+        sessionRows = [SelectableSession(token: token, title: "Selected fixture", accountLabel: source.label, project: "fixture", cwd: "/fixture", activeAt: Date().timeIntervalSince1970 * 1000, archived: false, running: false, related: [token])]
+        selectedSessions = [token]
+    }
     func checkSweep() { sweep() }
     func checkFinish(_ status: Int32) { finish(status, "fixture failure") }
     func checkOperation(_ args: [String]) { operationArgs = args }
@@ -10557,7 +10566,7 @@ struct StateChecks {
                 sweepReply(item, #"{"swept":true,"ok":true,"complete":true,"issues":0}"#)
                 precondition(item.restartAvailable && item.symbol == "info.circle")
                 item.selectTarget("work/personal")
-                precondition(item.primaryTitle == "Move")
+                precondition(item.primaryTitle == "Move 1 session")
                 precondition(!item.restartAvailable && item.symbol == "arrow.left.arrow.right")
             } else {
                 precondition(item.displaySummary.contains("will retry automatically") && item.primaryTitle == nil)
@@ -10615,7 +10624,7 @@ struct StateChecks {
         let undoActions = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("26-undo-ready").utf8)))
         precondition(undoActions.primaryTitle == "Finish undo" && undoActions.links.isEmpty)
         let freshActions = Model(demo: Demo.accounts)
-        precondition(freshActions.primaryTitle == "Move" && freshActions.links.isEmpty)
+        precondition(freshActions.primaryTitle == "Move 1 session" && freshActions.links.isEmpty)
         freshActions.skipRestartWarning = true
         precondition(freshActions.links.map(\.title) == ["Show restart warnings"])
         freshActions.links[0].action()
@@ -10863,12 +10872,12 @@ struct StateChecks {
         precondition(background.visibleCompletion?.summary == done && background.visibleCompletion?.detail == "History verified" && background.screen == .moved)
         precondition(background.from.isEmpty && background.to == nil && background.symbol == "arrow.left.arrow.right")
         background.selectTarget("home/personal")
-        precondition(background.primaryTitle == "Move" && background.visibleCompletion?.summary == done)
+        precondition(background.primaryTitle == "Move 1 session" && background.visibleCompletion?.summary == done)
         background.panelVisibility(false)
         background.panelVisibility(true)
         requests.last!.1(recordedAt("2026-10-30T21-00-00-000"))
         requests.last!.2(0, "")
-        precondition(background.visibleCompletion?.summary == done && background.primaryTitle == "Move")
+        precondition(background.visibleCompletion?.summary == done && background.primaryTitle == "Move 1 session")
         precondition(notices == ["499 moved. Checking the remaining source conversations.", done])
         let relaunched = recordedModel("2026-10-30T21-00-00-000")
         precondition(relaunched.visibleCompletion?.summary == done && relaunched.links.map(\.title) == ["Undo last move"])
@@ -10918,14 +10927,15 @@ struct StateChecks {
         requests = []
         notices = []
         let leaving = Model(demo: try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts("05-other-login").utf8)))
-        precondition(leaving.primaryTitle == "Leave old copies and move" && leaving.movable)
+        precondition(leaving.primaryTitle == "Move 1 session" && leaving.movable)
         leaving.selectTarget("home/personal")
         leaving.skipRestartWarning = true
+        let leaveTokens = leaving.selectedSessions.sorted()
         leaving.primary()
         precondition(requests.count == 1 && requests[0].0 == ["keep-local", "--json", "--leave-check", String(repeating: "3", count: 64)])
         requests[0].1(#"{"done":true,"ok":true,"complete":true,"keptLocal":1,"heldCancelled":0}"#)
         requests[0].2(0, "")
-        let leaveMove = ["--from", "work company", "--from", "work personal", "--to", "home personal", "--cloud", "--json"]
+        let leaveMove = ["--from", "work company", "--from", "work personal", "--to", "home personal", "--json"] + leaveTokens.flatMap { ["--session", $0] }
         precondition(requests.count == 2 && requests[1].0 == leaveMove && leaving.running)
         requests[1].1(#"{"plan":true,"kind":"move","token":"leave-token","affected":[]}"#)
         requests[1].2(0, "")
@@ -10947,7 +10957,7 @@ struct StateChecks {
         refreshReply(waiting, wordingAccounts("44-login-retry"))
         precondition(waiting.statusDetail?.hasPrefix("Waiting for Claude to finish signing in.") == true)
         refreshReply(waiting, wordingAccounts("05-other-login"))
-        precondition(waiting.statusDetail?.contains("Sign Claude in as home@example.test") == true && waiting.primaryTitle == "Leave old copies and move")
+        precondition(waiting.statusDetail?.contains("Sign Claude in as home@example.test") == true && waiting.primaryTitle == "Move 1 session")
         let ghost = Account(account: "ghost", org: "ghost-org", email: nil, orgName: nil, label: "ghost · ghost-or", active: false, signedIn: false, activeAt: nil, pending: nil, pendingFailures: nil, sessions: 0)
         let crowded = Model(demo: Demo.accounts + [ghost])
         precondition(crowded.visibleAccounts.map(\.id) == Demo.accounts.map(\.id))
@@ -10958,58 +10968,10 @@ struct StateChecks {
         let activeGhost = Account(account: "ghost", org: "ghost-org", email: nil, orgName: nil, label: "ghost · ghost-or", active: true, signedIn: true, activeAt: nil, pending: nil, pendingFailures: nil, sessions: 0)
         precondition(Model(demo: [activeGhost] + Demo.accounts.dropFirst()).visibleAccounts.contains { $0.id == ghost.id })
         requests = []
-        func offered(_ accounts: [Account] = Demo.accounts) -> Model {
-            let model = Model(demo: accounts)
-            model.config = Config(node: "/bin/sh", script: "/fixture/transplant.js")
-            model.checkForUpdate()
-            fetches.last!("4.10.0")
-            return model
-        }
-        let checker = offered()
-        precondition(fetches.count == 1 && checker.newer == "4.10.0" && checker.links.map(\.title) == ["Update to 4.10.0"])
+        let checker = Model(demo: Demo.accounts)
         checker.checkForUpdate()
-        fetches.last!(nil)
-        precondition(fetches.count == 2 && checker.links.map(\.title) == ["Update to 4.10.0"])
-        for version in ["4.2.1", "4.2.0", "3.99.99", "4.2", "4.2.1.0", "4.3.0-beta.1", "v4.3.0", " 4.3.0", "4.+3.0", "4..0", "", "４.３.０", "4.10.0 --registry=https://example.invalid", "latest", "../4.10.0"] {
-            checker.checkForUpdate()
-            fetches.last!("4.10.0")
-            checker.checkForUpdate()
-            fetches.last!(version)
-            checker.update()
-            precondition(checker.newer == nil && checker.links.isEmpty && launches.isEmpty, version)
-        }
-        let busy = offered()
-        busy.begin()
-        precondition(busy.links.isEmpty)
-        for name in ["17-uncertain", "10-interrupted", "11-repair"] {
-            precondition(!offered(try! JSONDecoder().decode([Account].self, from: Data(wordingAccounts(name).utf8))).links.contains { $0.title.hasPrefix("Update") }, name)
-        }
-        let blocked = offered()
-        blocked.handle(#"{"done":true,"ok":false,"complete":false,"partial":true,"summary":{"moved":2,"notMoved":[{"id":"fixture","error":"failed"}],"groups":[],"attention":[]}}"#)
-        precondition(blocked.directActions && blocked.pendingAccounts.isEmpty && !blocked.links.contains { $0.title.hasPrefix("Update") })
-        let updater = offered()
-        updater.links.last!.action()
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
-        precondition(launches.count == 1 && updater.note == "Updating to 4.10.0." && updater.links.isEmpty && !updater.canMutate)
-        precondition(launches[0].0.executableURL?.path == "/bin/npx" && launches[0].0.arguments == ["-y", "claude-transplant@4.10.0", "menubar"])
-        precondition(launches[0].0.environment?["PATH"] == "/bin:" + path && launches[0].0.environment?["HOME"] == ProcessInfo.processInfo.environment["HOME"])
-        updater.reset()
-        precondition(updater.note == "Updating to 4.10.0." && requests.isEmpty)
-        launches[0].1(1, "npm error 404 Not Found")
-        precondition(updater.note == "Update to 4.10.0 failed." && updater.detailLines.contains { $0 == ("reason", "npm error 404 Not Found") })
-        precondition(updater.canMutate && updater.links.map(\.title) == ["Update to 4.10.0"])
-        updater.config = Config(node: "/fixture/stale/bin/node", script: "/fixture/transplant.js")
-        updater.update()
-        precondition(launches.count == 2 && launches[1].0.executableURL?.path == "/fixture/found/bin/npx" && launches[1].0.environment?["PATH"] == "/fixture/found/bin:" + path)
-        let queuedUpdate = offered()
-        queuedUpdate.checkSweep()
-        queuedUpdate.update()
-        precondition(launches.count == 2 && requests.count == 1 && queuedUpdate.note == "Updating to 4.10.0." && !queuedUpdate.canMutate)
-        requests[0].1(#"{"swept":true,"ok":true}"#)
-        requests[0].2(0, "")
-        queuedUpdate.checkSweep()
-        queuedUpdate.update()
-        precondition(launches.count == 3 && requests.count == 1 && launches[2].0.arguments == ["-y", "claude-transplant@4.10.0", "menubar"])
+        checker.update()
+        precondition(fetches.isEmpty && launches.isEmpty && checker.newer == nil)
         print("Swift queue and metadata states passed")
     }
 }
@@ -12222,4 +12184,220 @@ test('native string-size errors during final verification become scoped parser l
   now += 60000
   assert.equal((await finishPending(f.h.paths, f.options)).pending, true)
   assert.equal(f.rows[0].reads, reads)
+})
+
+test('selective: session listing is scoped, distinguishes duplicate titles, and reports running work', async () => {
+  const h = await home(), other = id(7801)
+  await h.record('P', SOURCE, { title: 'Same title' })
+  await h.record('P', other, { title: 'Same title' })
+  await h.record('T', id(7802), { title: 'Unrelated destination' })
+  const from = (await accounts(h.paths, [])).filter(a => a.account === h.acct.P)
+  const rows = selectableSessions(from, desktopFixture(SOURCE))
+  assert.equal(rows.length, 2)
+  assert.equal(new Set(rows.map(row => row.token)).size, 2)
+  assert.equal(rows.filter(row => row.running).length, 1)
+  const result = await cli(h.root, ['sessions', '--from', h.acct.P, '--json'])
+  assert.equal(result.code, 0, result.stderr)
+  assert.equal(JSON.parse(result.stdout).length, 2)
+  assert.throws(() => selectSessions(from, []), /at least one/)
+  assert.throws(() => selectSessions(from, ['unknown']), /no longer/)
+  assert.throws(() => selectSessions(from, [rows[0].token, rows[0].token]), /unique/)
+})
+
+test('selective: moving one session preserves unselected records and transcripts and supports undo', async () => {
+  const h = await home(), other = id(7811)
+  for (const sid of [SOURCE, other]) {
+    await h.write(sid, [entry('user', sid === SOURCE ? 1 : 2, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths, []), from = all.filter(a => a.account === h.acct.P), to = all.find(a => a.account === h.acct.T)
+  const token = selectableSessions(from).find(row => row.token.endsWith(SOURCE)).token
+  const untouched = await readFile(path.join(h.dir('P'), `local_${other}.json`)), transcript = await readFile(path.join(h.project, `${other}.jsonl`))
+  const selected = selectSessions(from, [token])
+  const result = await executeMove(selected, to, h.paths, { processes: [] })
+  assert.equal(result.ok, true)
+  assert.equal(result.receipt.sessions.length, 1)
+  assert.equal(result.receipt.selectionScoped, true)
+  assert.deepEqual(result.receipt.cloudChecks, [])
+  assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${other}.json`)), untouched)
+  assert.deepEqual(await readFile(path.join(h.project, `${other}.jsonl`)), transcript)
+  assert.equal(await stat(path.join(h.dir('T'), `local_${other}.json`)).catch(() => null), null)
+  const undone = await undo(h.paths)
+  assert.ok(undone.dest)
+  assert.ok(await stat(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+  assert.deepEqual(await readFile(path.join(h.dir('P'), `local_${other}.json`)), untouched)
+})
+
+test('selective: dry run and invalid cloud combination never mutate session files', async () => {
+  const h = await home(), other = id(7821)
+  for (const sid of [SOURCE, other]) {
+    await h.write(sid, [entry('user', sid === SOURCE ? 1 : 2, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const from = (await accounts(h.paths, [])).filter(a => a.account === h.acct.P), token = selectableSessions(from)[0].token
+  const args = ['--from', h.acct.P, '--to', h.acct.T, '--session', token, '--json']
+  const planned = await cli(h.root, [...args, '--dry-run'])
+  assert.equal(planned.code, 0, planned.stderr)
+  assert.equal(lines(planned.stdout).at(-1).planned, 1)
+  const rejected = await cli(h.root, [...args, '--cloud'])
+  assert.notEqual(rejected.code, 0)
+  assert.match(rejected.stderr, /local only/)
+  assert.equal((await readdir(h.dir('P'))).filter(f => f.startsWith('local_')).length, 2)
+  assert.deepEqual(await readdir(h.dir('T')), [])
+})
+
+test('selective: fork and scheduled task families require explicit complete selection', async () => {
+  const h = await home(), child = id(7831), notification = id(7832)
+  await h.record('P', SOURCE, rehomeRecord())
+  await h.record('P', child, { forkedFromSessionId: `local_${SOURCE}` })
+  await h.record('P', notification, { notifySessionId: `local_${child}`, scheduledTaskId: 'job' })
+  const from = (await accounts(h.paths, [])).filter(a => a.account === h.acct.P), rows = selectableSessions(from)
+  assert.equal(rows.length, 3)
+  assert.ok(rows.every(row => row.related.length === 3))
+  assert.throws(() => selectSessions(from, [rows[0].token]), /linked sessions/)
+  assert.equal(selectSessions(from, rows.map(row => row.token))[0].sessions.length, 3)
+})
+
+test('selective: restart approval binds the selected files and rejects scope widening', async () => {
+  const h = await home(), other = id(7841)
+  for (const sid of [SOURCE, other]) {
+    await h.write(sid, [entry('user', sid === SOURCE ? 1 : 2, null, sid)])
+    await h.record('P', sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths, []), from = all.filter(a => a.account === h.acct.P), to = all.find(a => a.account === h.acct.T)
+  const rows = selectableSessions(from), token = rows.find(row => row.token.endsWith(SOURCE)).token
+  const planned = await executeMove(selectSessions(from, [token]), to, h.paths, { processes: desktopFixture(SOURCE) })
+  assert.ok(planned.plan)
+  assert.equal(planned.plan.selection.scoped, true)
+  assert.equal(planned.plan.selection.from[0].files.length, 1)
+  for (const selection of [from, selectSessions(from, rows.map(row => row.token))]) {
+    const result = await executeMove(selection, to, h.paths, { processes: desktopFixture(SOURCE), approve: planned.plan.token })
+    assert.equal(result.code, 'RESTART_APPROVAL_CHANGED')
+  }
+  assert.equal((await readdir(h.dir('P'))).filter(f => f.startsWith('local_')).length, 2)
+})
+
+test('selective: replanning refuses a new unselected dependent session', async () => {
+  const h = await home(), child = id(7851)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths, []), from = all.filter(a => a.account === h.acct.P), to = all.find(a => a.account === h.acct.T)
+  const selected = selectSessions(from, [selectableSessions(from)[0].token])
+  await h.record('P', child, { forkedFromSessionId: `local_${SOURCE}` })
+  await assert.rejects(executeMove(selected, to, h.paths, { processes: [] }), /linked sessions/)
+  assert.ok(await stat(path.join(h.dir('P'), `local_${SOURCE}.json`)))
+})
+
+test('selective: empty cross-account folders do not become confirmed logins', async () => {
+  const h = await home()
+  await mkdir(path.join(h.paths.records, h.acct.P, h.org.T), { recursive: true })
+  const all = await accounts(h.paths, [])
+  assert.equal(all.find(a => a.account === h.acct.P && a.org === h.org.P).confirmed, true)
+  assert.equal(all.find(a => a.account === h.acct.P && a.org === h.org.T).confirmed, false)
+})
+
+test('selective: Swift picker starts empty, filters dates, selects linked sessions, and emits only selected tokens', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-selective-ui-'))
+  const source = await swiftFixtureSource(false) + String.raw`
+@main
+struct SelectivePickerChecks {
+    @MainActor static func main() throws {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        let source = Account(account: "source", org: "personal", email: "personal@example.com", orgName: "Personal", label: "personal@example.com · Personal", active: true, signedIn: true, activeAt: 100, pending: nil, pendingFailures: nil, confirmed: true, sessions: 3)
+        let target = Account(account: "target", org: "stanford", email: "work@example.edu", orgName: "Stanford", label: "work@example.edu · Stanford", active: false, signedIn: false, activeAt: 1, pending: nil, pendingFailures: nil, confirmed: true, sessions: 0)
+        let ghost = Account(account: "source", org: "wrong", email: "personal@example.com", orgName: nil, label: "Ghost", active: false, signedIn: false, activeAt: 0, pending: nil, pendingFailures: nil, confirmed: false, sessions: 0)
+        let model = Model(demo: [source, target, ghost])
+        precondition(!model.ready && model.selectedSessions.isEmpty)
+        precondition(!model.visibleAccounts.contains { $0.id == ghost.id })
+        model.selectTarget(target.id)
+        if !model.from.contains(source.id) { model.toggle(source.id) }
+        let now = Date().timeIntervalSince1970 * 1000
+        let first = SelectableSession(token: "source/personal/local_one", title: "EM continuation", accountLabel: source.label, project: "em-olmo", cwd: "/code/em-olmo", activeAt: now, archived: false, running: true, related: ["source/personal/local_one", "source/personal/local_two"])
+        let linked = SelectableSession(token: "source/personal/local_two", title: "EM parent", accountLabel: source.label, project: "em-olmo", cwd: "/code/em-olmo", activeAt: now - 60 * 86_400_000, archived: false, running: false, related: first.related)
+        let other = SelectableSession(token: "source/personal/local_three", title: "Older unrelated work", accountLabel: source.label, project: "mstar", cwd: "/code/mstar", activeAt: now - 60 * 86_400_000, archived: false, running: false, related: ["source/personal/local_three"])
+        model.sessionRows = [first, linked, other]
+        precondition(model.filteredSessions.map(\.token) == [first.token])
+        model.toggleSession(first)
+        precondition(model.selectedSessions == Set(first.related) && model.ready && model.primaryTitle == "Move 2 sessions")
+        model.sessionSearch = "MSTAR"
+        precondition(model.filteredSessions.isEmpty && model.selectedSessions.count == 2)
+        model.sessionDays = 0
+        precondition(model.filteredSessions.map(\.token) == [other.token])
+        model.selectShownSessions()
+        precondition(model.selectedSessions.count == 3)
+        model.toggleSession(linked)
+        precondition(model.selectedSessions == [other.token])
+        model.selectedSessions = []
+        model.sessionSearch = ""
+        model.sessionDays = 30
+        model.selectShownSessions()
+        precondition(model.selectedSessions == Set(first.related))
+        guard let image = Snapshot.data(model) else { fatalError("No picker image") }
+        try image.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))
+        requests = []
+        selectionDialogResponse = .alertSecondButtonReturn
+        model.move()
+        precondition(requests.isEmpty && !model.running)
+        selectionDialogResponse = .alertFirstButtonReturn
+        model.move()
+        precondition(requests.count == 1 && model.running)
+        let args = requests[0].0
+        precondition(!args.contains("--cloud"))
+        precondition(args.filter { $0 == "--session" }.count == 2)
+        precondition(args.contains(first.token) && args.contains(linked.token) && !args.contains(other.token))
+        let stale = Model(demo: [source, target])
+        stale.config = Config(node: "/bin/false", script: "/fixture/transplant.js")
+        stale.loadSessions()
+        let response = requests.last!
+        stale.from = []
+        response.1("[]")
+        response.2(0, "")
+        precondition(stale.sessionRows.isEmpty && stale.selectedSessions.isEmpty && !stale.loadingSessions)
+        stale.checkForUpdate()
+        precondition(fetches.isEmpty)
+        print("Selective picker passed")
+    }
+}
+`
+  const file = path.join(root, 'picker.swift'), binary = path.join(root, 'picker'), png = path.join(root, 'picker.png')
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [png], { timeout: 15_000 })
+  assert.match(stdout, /Selective picker passed/)
+  assert.deepEqual((await readFile(png)).subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+  t.diagnostic(`Picker screenshot: ${png}`)
+})
+
+test('selective: an approved restart moves only selected sessions across multiple source accounts', async () => {
+  const h = await home(), regular = id(7861), untouched = id(7862)
+  for (const [account, sid] of [['P', SOURCE], ['Z', regular], ['P', untouched]]) {
+    await h.write(sid, [entry('user', sid === SOURCE ? 1 : sid === regular ? 2 : 3, null, sid)])
+    await h.record(account, sid, rehomeRecord())
+  }
+  const all = await accounts(h.paths, []), from = all.filter(a => [h.acct.P, h.acct.Z].includes(a.account)), to = all.find(a => a.account === h.acct.T)
+  const selected = selectSessions(from, selectableSessions(from).filter(row => !row.token.endsWith(untouched)).map(row => row.token))
+  const mock = taskHarness(desktopFixture(SOURCE))
+  const plan = await executeMove(selected, to, h.paths, { io: mock.io })
+  assert.ok(plan.plan)
+  const result = await executeMove(selected, to, h.paths, { io: mock.io, approve: plan.plan.token })
+  assert.equal(result.ok, true, result.reason)
+  assert.equal(result.receipt.sessions.length, 2)
+  assert.ok(await stat(path.join(h.dir('P'), `local_${untouched}.json`)))
+  assert.equal(await stat(path.join(h.dir('T'), `local_${untouched}.json`)).catch(() => null), null)
+})
+
+test('selective: held recovery keeps its selection after unselected sessions appear', async () => {
+  const h = await home(), untouched = id(7871)
+  await h.write(SOURCE, [entry('user', 1, null, SOURCE)])
+  await h.record('P', SOURCE, rehomeRecord())
+  const all = await accounts(h.paths, []), from = all.filter(a => a.account === h.acct.P), to = all.find(a => a.account === h.acct.T)
+  const result = await executeMove(selectSessions(from, [selectableSessions(from)[0].token]), to, h.paths, { processes: desktopFixture(SOURCE), moveOnly: true })
+  assert.equal(result.receipt.held.length, 1)
+  await h.write(untouched, [entry('user', 2, null, untouched)])
+  await h.record('P', untouched, rehomeRecord())
+  const finished = await finishHeld(h.paths, { processes: [] })
+  assert.equal(finished.ok, true, finished.reason)
+  assert.equal(finished.receipt.sessions.length, 1)
+  assert.equal(finished.receipt.selectionScoped, true)
+  assert.ok(await stat(path.join(h.dir('P'), `local_${untouched}.json`)))
 })

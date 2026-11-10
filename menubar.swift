@@ -14,6 +14,7 @@ struct Account: Decodable, Identifiable {
     let pending: String?
     let pendingFailures: [Failure]?
     var stats: String? = nil
+    var confirmed: Bool? = nil
     var identityState: String? = nil
     var pendingAction: String? = nil
     var pendingWaiting: [HeldRecord]? = nil
@@ -37,6 +38,23 @@ struct Account: Decodable, Identifiable {
     var selector: String { account + " " + org }
     var name: String { email ?? String(account.prefix(8)) }
     var plan: String { orgName ?? String(org.prefix(8)) }
+}
+
+struct SelectableSession: Decodable, Identifiable {
+    let token: String
+    let title: String
+    let accountLabel: String
+    let project: String
+    let cwd: String
+    let activeAt: Double
+    let archived: Bool
+    let running: Bool
+    let related: [String]
+    var id: String { token }
+    var activity: String {
+        guard activeAt > 0 else { return "Unknown activity" }
+        return Date(timeIntervalSince1970: activeAt / 1000).formatted(date: .abbreviated, time: .omitted)
+    }
 }
 
 struct Config: Decodable {
@@ -297,7 +315,7 @@ struct MoveProgress {
 @MainActor
 final class Model: ObservableObject {
     @Published var accounts: [Account] = []
-    @Published var from: Set<String> = []
+    @Published var from: Set<String> = [] { didSet { if from != oldValue { loadSessions(reset: true) } } }
     @Published var to: String?
     @Published var excluded: Set<String> = []
     @Published var lanes: [String: String] = [:]
@@ -322,6 +340,13 @@ final class Model: ObservableObject {
     @Published var skipRestartWarning = UserDefaults.standard.bool(forKey: "skipRestartWarning")
     @Published var restartAvailable = false
     @Published var moveProgress = MoveProgress()
+    @Published var sessionRows: [SelectableSession] = []
+    @Published var selectedSessions: Set<String> = []
+    @Published var sessionSearch = ""
+    @Published var sessionDays = 30
+    @Published var loadingSessions = false
+    @Published var sessionError = ""
+    private var sessionRequest = UUID()
     var snapshotFailed = false
     let snapshot: Bool
     let demo: Bool
@@ -391,7 +416,7 @@ final class Model: ObservableObject {
     var tooltip: String { running ? moveProgress.detail : "Claude Transplant" }
     var pendingAccounts: [Account] { accounts.filter { $0.pending != nil } }
     var visibleAccounts: [Account] { accounts.filter { listed($0) || $0.id == to } }
-    private func listed(_ account: Account) -> Bool { account.active == true || account.email != nil || account.sessions != 0 }
+    private func listed(_ account: Account) -> Bool { account.active == true || account.confirmed == true || (account.confirmed == nil && (account.email != nil || account.sessions != 0)) || (account.sessions ?? 0) > 0 || account.pending != nil }
     private var latestReceipt: String? { accounts.lazy.compactMap(\.receipt).first }
     private func signInNeeded(_ account: Account) -> Bool { account.pendingAction == "sign-in" && account.identityState != "unknown" }
     private var leaveChecks: [String] {
@@ -421,10 +446,7 @@ final class Model: ObservableObject {
     private var canUpdate: Bool { newer != nil && canMutate && pendingAccounts.isEmpty && !directActions }
 
     func checkForUpdate() {
-        latest { [weak self] version in
-            guard let self, let version else { return }
-            newer = version.wholeMatch(of: #/[0-9]+\.[0-9]+\.[0-9]+/#) != nil && Model.version.map({ version.compare($0, options: .numeric) == .orderedDescending }) == true ? version : nil
-        }
+        newer = nil
     }
 
     func update() {
@@ -456,7 +478,7 @@ final class Model: ObservableObject {
         if pendingAccounts.contains(where: { $0.pending == "undo" }) { return "Finish undo" }
         return "Finish the move"
     }
-    var ready: Bool { canMutate && movable && !from.isEmpty && to != nil && (config != nil || demo) }
+    var ready: Bool { canMutate && movable && !from.isEmpty && to != nil && !loadingSessions && sessionError.isEmpty && !selectedSessions.isEmpty && (config != nil || demo) }
     private var pendingMoved: Int { max(sourceActivity?.moved ?? 0, receiptSummaries.isEmpty ? pendingAccounts.compactMap(\.receiptMoved).max() ?? 0 : receiptSummaries.reduce(0) { $0 + $1.moved }) }
     var pendingPrompt: String {
         guard !pendingAccounts.isEmpty || receiptSummaries.contains(where: { !$0.notMoved.isEmpty }) else { return "" }
@@ -511,7 +533,7 @@ final class Model: ObservableObject {
         if retryable && !operationArgs.isEmpty { return "Try again" }
         if !movable { return pendingReady ? pendingButtonTitle : nil }
         if partialResult { return nil }
-        return !pendingResult && !stopped && ready ? leaveChecks.isEmpty ? "Move" : "Leave old copies and move" : nil
+        return !pendingResult && !stopped && ready ? "Move \(quantity(selectedSessions.count, "session", "sessions"))" : nil
     }
     func primary() {
         if stopped && !operationArgs.isEmpty && continuationArgs.isEmpty { return }
@@ -704,6 +726,7 @@ final class Model: ObservableObject {
             if pendingResult && movable { pendingResult = false; clearSelection() }
             if notifyWhenDone && pendingAccounts.isEmpty { notifyWhenDone = false; if let done = receiptCompletion { notify(done.summary, "") } }
             settle()
+            if panelOpen && !from.isEmpty { loadSessions() }
             if !pendingAccounts.isEmpty && !preserveNotice {
                 completion = nil
                 badge = ""
@@ -719,12 +742,61 @@ final class Model: ObservableObject {
 
     func move() {
         guard ready, let target = accounts.first(where: { $0.id == to }) else { return }
-        let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] } + ["--to", target.selector, "--cloud", "--json"]
+        let chosen = sessionRows.filter { selectedSessions.contains($0.token) }
+        guard chosen.count == selectedSessions.count else { loadSessions(reset: true); return }
+        let alert = NSAlert()
+        alert.messageText = "Move \(quantity(chosen.count, "session", "sessions")) to \(target.label)?"
+        alert.informativeText = chosen.prefix(15).map { "• \($0.title) — \($0.project)" }.joined(separator: "\n")
+            + (chosen.count > 15 ? "\n…and \(chosen.count - 15) more." : "")
+            + "\n\nOnly the selected local sessions will move. Source records are backed up; cloud copies are kept. If Claude must restart, you’ll review that separately."
+        alert.addButton(withTitle: "Move selected sessions")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let args = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] }
+            + ["--to", target.selector, "--json"] + selectedSessions.sorted().flatMap { ["--session", $0] }
         let checks = leaveChecks, kept = pendingAccounts.map { ("kept", "\(oldCopies($0)) left unarchived in \($0.label)") }
         dismiss()
         left = []
         if !checks.isEmpty { followUp = { [weak self] in self?.left = kept; self?.start(args) } }
         start(checks.isEmpty ? args : leave(checks))
+    }
+
+    var filteredSessions: [SelectableSession] {
+        let cutoff = Date().timeIntervalSince1970 * 1000 - Double(sessionDays) * 86_400_000
+        return sessionRows.filter {
+            (sessionDays == 0 || $0.activeAt >= cutoff) &&
+            (sessionSearch.isEmpty || "\($0.title) \($0.project) \($0.cwd) \($0.accountLabel)".localizedCaseInsensitiveContains(sessionSearch))
+        }
+    }
+
+    func loadSessions(reset: Bool = false) {
+        let request = UUID()
+        sessionRequest = request
+        if reset { selectedSessions = []; sessionRows = []; sessionError = "" }
+        guard !from.isEmpty, config != nil, !running else { loadingSessions = false; return }
+        loadingSessions = true
+        let sources = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] }
+        var text = ""
+        run(["sessions", "--json"] + sources, line: { text += $0 }) { [weak self] status, error in
+            guard let self, sessionRequest == request else { return }
+            loadingSessions = false
+            guard status == 0, let data = text.data(using: .utf8), let rows = try? JSONDecoder().decode([SelectableSession].self, from: data) else {
+                sessionRows = []; selectedSessions = []; sessionError = error.isEmpty ? "Could not load sessions. Refresh to try again." : error
+                return
+            }
+            sessionRows = rows
+            selectedSessions.formIntersection(Set(rows.map(\.token)))
+            sessionError = ""
+        }
+    }
+
+    func toggleSession(_ session: SelectableSession) {
+        if selectedSessions.contains(session.token) { selectedSessions.subtract(session.related) }
+        else { selectedSessions.formUnion(session.related) }
+    }
+
+    func selectShownSessions() {
+        selectedSessions.formUnion(filteredSessions.flatMap(\.related))
     }
 
     func undo() {
@@ -1419,13 +1491,16 @@ struct Panel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 8) {
-                Text("Claude Transplant").font(.system(.title3, design: .rounded, weight: .semibold))
+                Text("Claude Transplant · Nick’s fork").font(.system(.title3, design: .rounded, weight: .semibold))
                 if let label = model.identityLabel { Text(label).font(.caption).foregroundStyle(.secondary) }
                 Spacer()
                 Button(action: { model.reset() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
                     .accessibilityLabel("Reset").help("Clear account selections").disabled(model.running || model.updating || !model.movable)
             }
             accountBoard.disabled(!model.canMutate || !model.movable)
+            if model.movable && !model.from.isEmpty && !model.running {
+                sessionPicker.disabled(!model.canMutate)
+            }
             if !model.displaySummary.isEmpty || model.visibleCompletion != nil { Divider() }
             if model.running {
                 Bar(value: model.moveProgress.value)
@@ -1494,6 +1569,53 @@ struct Panel: View {
         } else {
             ScrollView(.vertical) { board }
                 .frame(height: CGFloat(Panel.visibleRows * 34 + 18))
+        }
+    }
+
+    private var sessionPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            HStack {
+                Text("Choose sessions").font(.callout.weight(.semibold))
+                Spacer()
+                Text("\(model.selectedSessions.count) selected").font(.caption).foregroundStyle(.secondary)
+            }
+            HStack {
+                TextField("Search title or project", text: $model.sessionSearch).textFieldStyle(.roundedBorder)
+                Picker("Activity", selection: $model.sessionDays) {
+                    Text("Last 7 days").tag(7)
+                    Text("Last 30 days").tag(30)
+                    Text("All dates").tag(0)
+                }.labelsHidden().frame(width: 140)
+            }
+            HStack {
+                Button("Select shown") { model.selectShownSessions() }.disabled(model.loadingSessions || model.filteredSessions.isEmpty)
+                Button("Clear selection") { model.selectedSessions = [] }.disabled(model.selectedSessions.isEmpty)
+                Spacer()
+                if model.loadingSessions { ProgressView().controlSize(.small) }
+                Button(action: { model.loadSessions() }) { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh sessions")
+            }.font(.caption).buttonStyle(.plain)
+            if !model.sessionError.isEmpty {
+                Text(model.sessionError).font(.caption).foregroundStyle(.orange)
+            } else if model.filteredSessions.isEmpty && !model.loadingSessions {
+                Text("No sessions match. Try All dates or a different source.").font(.caption).foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 9) {
+                        ForEach(model.filteredSessions) { session in
+                            Toggle(isOn: Binding(get: { model.selectedSessions.contains(session.token) }, set: { _ in model.toggleSession(session) })) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(session.title).font(.callout).lineLimit(1)
+                                    Text("\(session.project) · \(session.activity)\(session.running ? " · Running" : "")\(session.archived ? " · Archived" : "")\(session.related.count > 1 ? " · \(session.related.count) linked sessions" : "")")
+                                        .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                }
+                            }.toggleStyle(.checkbox).help("\(session.accountLabel)\n\(session.cwd)\n\(session.token)")
+                        }
+                    }.padding(.vertical, 3)
+                }.frame(height: 175)
+            }
+            Text("Local Code sessions only; cloud copies are kept. Linked sessions are selected together, including matches outside the current filter.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -1569,10 +1691,13 @@ enum Snapshot {
         let content = Group {
             if let size { panel.frame(width: size.width, height: size.height, alignment: .top) } else { panel }
         }.background(Color(white: 0.11))
-        let renderer = ImageRenderer(content: content)
-        renderer.scale = 2
-        guard let tiff = renderer.nsImage?.tiffRepresentation else { return nil }
-        return NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:])
+        let view = NSHostingView(rootView: content)
+        view.appearance = NSAppearance(named: .darkAqua)
+        view.setFrameSize(size ?? view.fittingSize)
+        view.layoutSubtreeIfNeeded()
+        guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return nil }
+        view.cacheDisplay(in: view.bounds, to: bitmap)
+        return bitmap.representation(using: .png, properties: [:])
     }
 
     @MainActor

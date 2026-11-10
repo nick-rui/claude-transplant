@@ -53,11 +53,13 @@ const HELP = `claude-transplant   move Claude Code history between accounts
   claude-transplant finish      recover interrupted transfers, finish held records or active-source cloud work
   claude-transplant keep-local  cancel held work and cloud checks, keep completed moves
   claude-transplant accounts    list accounts
+  claude-transplant sessions --from <match> --json  list selectable local sessions
   claude-transplant restart     plan an explicit Desktop restart
   claude-transplant sweep       verify placed metadata and retry the active pending source
   claude-transplant menubar     install the menubar app, --snapshot <png>, --remove uninstalls
 
   --from <match> --to <match>   skip the picker, match on email, org name, or uuid prefix
+  --session <token>             move only this local session; repeat for multiple sessions
   --cloud                       reconcile active source, queue remaining local work and known source mirrors
   --move-only                   move eligible records without restarting Desktop
   --restart-approved <token>    execute the exact restart plan previously displayed
@@ -924,11 +926,13 @@ async function logins(paths) {
   const emails = new Map()
   const orgs = new Map()
   const pairs = new Map()
+  const confirmed = new Set()
   const take = async (file) => {
     const a = (await readJson(file).catch(() => ({}))).oauthAccount
     if (a?.accountUuid && a.emailAddress) emails.set(a.accountUuid, a.emailAddress)
     if (a?.organizationUuid && a.organizationName) orgs.set(a.organizationUuid, a.organizationType && !/team|enterprise/.test(a.organizationType) ? 'Personal' : a.organizationName)
     if (UUID.test(a?.accountUuid ?? '') && UUID.test(a?.organizationUuid ?? '')) pairs.set(`${a.accountUuid}/${a.organizationUuid}`, { account: a.accountUuid, org: a.organizationUuid })
+    if (UUID.test(a?.accountUuid ?? '') && UUID.test(a?.organizationUuid ?? '')) confirmed.add(`${a.accountUuid}/${a.organizationUuid}`)
   }
   for (const e of await readdir(paths.home, { withFileTypes: true }).catch(() => [])) {
     if (e.name.startsWith('.claude')) await take(e.isDirectory() ? path.join(paths.home, e.name, '.claude.json') : path.join(paths.home, e.name))
@@ -946,7 +950,7 @@ async function logins(paths) {
       if (r.emailAddress) emails.set(account, r.emailAddress)
     }
   }
-  return { emails, orgs, pairs }
+  return { emails, orgs, pairs, confirmed }
 }
 
 function ago(ms) {
@@ -1212,7 +1216,7 @@ const desktopSession = (file, record) => ({
 })
 
 export async function accounts(paths, processes = null) {
-  const { emails, orgs, pairs } = await logins(paths)
+  const { emails, orgs, pairs, confirmed } = await logins(paths)
   const cur = await signedIn(paths, processes)
   const out = []
   const stored = await records(paths.records)
@@ -1235,7 +1239,7 @@ export async function accounts(paths, processes = null) {
     const label = `${email ?? short(account)} · ${orgName ?? short(org)}`
     const base = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | -'
     const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}${taskError ? ' | task registry unreadable' : ''}`
-    out.push({ account, org, dir, email, orgName, sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state })
+    out.push({ account, org, dir, email, orgName, confirmed: confirmed.has(`${account}/${org}`), sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state })
   }
   const sessions = out.flatMap(account => account.sessions)
   const claims = Map.groupBy(sessions.flatMap(session => [...new Set([session.id, ...priorSessions(session.record)])]), id => id)
@@ -1247,6 +1251,59 @@ export async function accounts(paths, processes = null) {
   const chosen = mine.find((a) => a.org === cur.org)
   if (chosen) Object.assign(chosen, { active: true, stats: `${chosen.stats} | active` })
   return out.sort((a, b) => b.activeAt - a.activeAt)
+}
+
+const sessionToken = (account, session) => `${account.account}/${account.org}/${session.record.sessionId}`
+
+export function selectableSessions(from, processes = []) {
+  const live = workers(processes)
+  return from.flatMap(account => {
+    const sessions = account.allSessions ?? account.sessions
+    const graph = new Map()
+    const connect = (a, b) => {
+      if (!graph.has(a)) graph.set(a, new Set())
+      if (!graph.has(b)) graph.set(b, new Set())
+      graph.get(a).add(b)
+      graph.get(b).add(a)
+    }
+    for (const session of sessions) {
+      const record = session.record, key = `record:${record.sessionId}`
+      connect(key, key)
+      if (session.id) connect(key, `cli:${session.id}`)
+      for (const field of ['forkedFromSessionId', 'notifySessionId']) if (record[field]) connect(key, `record:${record[field]}`)
+      if (record.scheduledTaskId) connect(key, `task:${record.scheduledTaskId}`)
+    }
+    for (const task of account.taskSessions?.registry?.scheduledTasks ?? []) if (task.notifySessionId) connect(`task:${task.id}`, `record:${task.notifySessionId}`)
+    return sessions.map(session => {
+      const related = new Set([`record:${session.record.sessionId}`])
+      for (const key of related) for (const next of graph.get(key) ?? []) related.add(next)
+      return {
+        token: sessionToken(account, session), title: session.title || 'Untitled',
+        account: account.account, org: account.org, accountLabel: account.label,
+        project: path.basename(session.cwd || '') || 'Unknown project', cwd: session.cwd,
+        activeAt: session.activeAt, archived: session.record.isArchived === true,
+        running: ownsWorker(live, session.id, session.record.sessionId),
+        related: sessions.filter(row => related.has(`record:${row.record.sessionId}`)).map(row => sessionToken(account, row))
+      }
+    })
+  }).sort((a, b) => b.activeAt - a.activeAt || a.token.localeCompare(b.token))
+}
+
+export function selectSessions(from, tokens) {
+  if (!tokens.length) throw new Error('Choose at least one session')
+  const selected = new Set(tokens), rows = selectableSessions(from)
+  if (selected.size !== tokens.length) throw new Error('Session selections must be unique')
+  for (const token of selected) {
+    const row = rows.find(row => row.token === token)
+    if (!row) throw new Error('A selected session is no longer in the chosen source. Refresh the session list.')
+    const account = from.find(account => account.account === row.account && account.org === row.org)
+    if (account.taskError || account.unreadable?.length) throw new Error('The source has unreadable metadata. Repair it before selecting individual sessions.')
+    const missing = row.related.filter(token => !selected.has(token))
+    if (missing.length) throw new Error(`Select the linked sessions with "${row.title}": ${rows.filter(row => missing.includes(row.token)).map(row => row.title).join(', ')}`)
+  }
+  return from.map(account => ({ ...account, selected: true,
+    sessions: account.sessions.filter(session => selected.has(sessionToken(account, session))), unreadable: []
+  })).filter(account => account.sessions.length)
 }
 
 async function index(pool) {
@@ -2332,6 +2389,7 @@ export async function inventory(from, to, paths, report = () => {}, options = {}
     sources: found,
     from: from.map((a) => a.label),
     fromAccounts: from.map(accountRef),
+    selectionScoped: from.some(account => account.selected),
     cloudCheckAccounts,
     pendingCloud: cloudRequested ? cloudCheckAccounts.length - (cloudPlan.checked && !cloudPlan.blocked.length && !cloudPlan.waiting?.length ? 1 : 0) : 0,
     toAccount: accountRef(to),
@@ -4269,6 +4327,7 @@ async function transferRecords(inv, to, paths, report, context = {}) {
     to: to.label,
     fromAccounts: inv.fromAccounts ?? [],
     toAccount: inv.toAccount ?? accountRef(to),
+    selectionScoped: inv.selectionScoped === true,
     cloudChecks: inv.cloudRequested ? [...new Map([...(inv.cloudCheckAccounts ?? inv.fromAccounts ?? []), ...(inv.deferredCloudSources ?? [])].map((account) => [`${account.account}/${account.org}`, { ...account, status: 'pending' }])).values()] : [],
     cloudError: inv.cloudError || null,
     cloudLinks: sourceCloudLinks([...inv.move, ...inv.there]),
@@ -4644,6 +4703,7 @@ export const move = (inv, to, paths, report = () => {}) => locked(paths, async (
 })
 
 export function executeMove(from, to, paths, options = {}) {
+  if (from?.some(account => account.selected) && (options.cloudRequested || options.cloud)) throw new Error('Selected-session moves are local only; cloud copies are kept')
   options = { ...options, cloudRequested: options.cloudRequested === true || Boolean(options.cloud) }
   const report = options.report ?? (() => {})
   const approving = options.approve != null
@@ -4658,7 +4718,10 @@ export function executeMove(from, to, paths, options = {}) {
     }
     if (saved && (saved.receiptFile ?? null) !== receiptFile) return { ok: false, reason: 'The approved pending receipt changed' }
     if ((options.undo || options.recover || saved?.receiptFile) && (await latestReceipt(paths))?.file !== receiptFile) return { ok: false, reason: 'The operation receipt changed' }
-    const selection = from ? { from: from.map((account) => ({ ...accountRef(account), files: [...account.sessions, ...account.unreadable].map(desktopFileOf) })), to: accountRef(to) } : null
+    const selection = from ? { from: from.map((account) => ({ ...accountRef(account), files: [...account.sessions, ...account.unreadable].map(desktopFileOf) })), to: accountRef(to), ...(from.some(account => account.selected) ? { scoped: true } : {}) } : null
+    if (saved && (Boolean(saved.selection?.scoped) !== Boolean(selection?.scoped) || selection?.scoped && stable(saved.selection.from.map(row => [row.account, row.org, [...row.files].sort()]).sort()) !== stable(selection.from.map(row => [row.account, row.org, [...row.files].sort()]).sort()))) {
+      return { ok: false, code: 'RESTART_APPROVAL_CHANGED', reason: 'The selected sessions changed after the restart plan' }
+    }
     if (saved && (Boolean(saved.selection) !== Boolean(selection) || selection && (!sameAccount(saved.selection.to, selection.to) || saved.selection.from.length !== selection.from.length || !saved.selection.from.every((source) => selection.from.some((row) => sameAccount(row, source)))))) {
       return { ok: false, code: 'RESTART_APPROVAL_CHANGED', reason: 'The selected accounts changed after the restart plan' }
     }
@@ -4692,8 +4755,9 @@ export function executeMove(from, to, paths, options = {}) {
       const sources = chosen.from.map((selected) => {
         const current = latest.find((account) => sameAccount(account, selected))
         if (!current) throw new Error(`${selected.label} is no longer available`)
+        if (chosen.scoped && selected.files.length) selectSessions([current], selected.files.map(file => `${current.account}/${current.org}/${path.basename(file, '.json')}`))
         const known = new Set([...current.sessions, ...current.unreadable].map(desktopFileOf))
-        return { ...current, sessions: current.sessions.filter((row) => selected.files.includes(row.file)),
+        return { ...current, selected: chosen.scoped === true, sessions: current.sessions.filter((row) => selected.files.includes(row.file)),
           unreadable: [...current.unreadable.filter((row) => selected.files.includes(desktopFileOf(row))), ...selected.files.filter((file) => !known.has(file))] }
       })
       const target = latest.find((account) => sameAccount(account, chosen.to))
@@ -4790,7 +4854,7 @@ export async function finishHeld(paths, options = {}) {
   const from = latest.receipt.fromAccounts.map((ref) => {
     const account = all.find((row) => sameAccount(row, ref))
     if (!account) throw new Error(`${ref.label} is no longer available`)
-    return { ...account, sessions: account.sessions.filter((row) => files.has(row.file)), unreadable: account.unreadable.filter((row) => files.has(desktopFileOf(row))) }
+    return { ...account, selected: latest.receipt.selectionScoped === true, sessions: account.sessions.filter((row) => files.has(row.file)), unreadable: account.unreadable.filter((row) => files.has(desktopFileOf(row))) }
   })
   const to = all.find((row) => sameAccount(row, latest.receipt.toAccount))
   if (!to) throw new Error('Destination account is no longer available')
@@ -5164,11 +5228,12 @@ async function menubar(paths, remove, snapshot) {
 }
 
 function parse(argv) {
-  const args = { from: [], to: null, cmd: null, dry: false, cloud: false, json: false, help: false, version: false, remove: false, snapshot: null, restartApproved: null, moveOnly: false, leaveChecks: [] }
+  const args = { from: [], sessions: [], to: null, cmd: null, dry: false, cloud: false, json: false, help: false, version: false, remove: false, snapshot: null, restartApproved: null, moveOnly: false, leaveChecks: [] }
   const value = (i) => { if (argv[i] === undefined || argv[i].startsWith('-')) throw new Error(`${argv[i - 1]} needs a value`); return argv[i] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--from') args.from.push(value(++i))
+    else if (a === '--session') args.sessions.push(value(++i))
     else if (a === '--to') args.to = value(++i)
     else if (a === '--dry-run') args.dry = true
     else if (a === '--cloud') args.cloud = true
@@ -5183,7 +5248,9 @@ function parse(argv) {
     else if (!a.startsWith('-') && !args.cmd) args.cmd = a
     else throw new Error(`unknown argument ${a}`)
   }
-  if ((args.from.length > 0) !== Boolean(args.to)) throw new Error('--from and --to go together')
+  if (args.cmd !== 'sessions' && (args.from.length > 0) !== Boolean(args.to)) throw new Error('--from and --to go together')
+  if (args.cmd === 'sessions' && (!args.from.length || args.to || args.sessions.length || args.dry || args.cloud || args.restartApproved || args.moveOnly)) throw new Error('sessions requires --from and accepts only --json')
+  if (args.sessions.length && (args.cmd || !args.from.length || args.cloud)) throw new Error('--session requires --from and --to; selected-session moves are local only, without --cloud')
   if ((args.help || args.version) && argv.length > 1) throw new Error(`${args.help ? '--help' : '--version'} goes alone`)
   const incompatible = args.from.length || args.to || args.dry || args.cloud || args.remove || args.snapshot
   if (['accounts', 'keep-local', 'sweep'].includes(args.cmd) && (incompatible || args.restartApproved || args.moveOnly)) throw new Error(`${args.cmd} accepts only --json`)
@@ -5211,7 +5278,7 @@ async function main(argv) {
     const prior = plan.receiptFile ? await readReceipt(plan.receiptFile).catch(() => null) : null
     if (args.json) return emit({ plan: true, ...plan, heldCount: heldCount(plan.held), remainingCount: plan.remainingCount ?? plan.selection?.from.reduce((sum, source) => sum + source.files.length, 0) ?? null,
       moved: prior?.sessions.length ?? 0, undoRecovery: Boolean(prior?.undoing), sourceLabels: plan.selection?.from.map(source => source.label) ?? prior?.fromAccounts?.map(source => source.label) ?? [] })
-    const selection = plan.kind === 'undo' ? 'undo' : plan.kind === 'recover' ? 'finish' : plan.resume ? 'finish' : plan.selection ? `${plan.selection.from.map((a) => `--from "${a.account} ${a.org}"`).join(' ')} --to "${plan.selection.to.account} ${plan.selection.to.org}"` : 'restart'
+    const selection = plan.kind === 'undo' ? 'undo' : plan.kind === 'recover' ? 'finish' : plan.resume ? 'finish' : plan.selection ? `${plan.selection.from.map((a) => `--from "${a.account} ${a.org}"`).join(' ')} --to "${plan.selection.to.account} ${plan.selection.to.org}"${plan.selection.scoped ? plan.selection.from.flatMap(a => a.files.map(file => ` --session "${a.account}/${a.org}/${path.basename(file, '.json')}"`)).join('') : ''}` : 'restart'
     out.write(`  restart     Claude Desktop must close before this operation\n  affected    ${[...new Set(plan.affected.map((row) => row.title))].join(', ') || 'no Code workers'}\n  approve     claude-transplant ${selection} --restart-approved ${plan.token}${args.cloud ? ' --cloud' : ''}\n`)
   }
   const showMove = async (result) => {
@@ -5404,6 +5471,10 @@ async function main(argv) {
     ].filter((line) => line !== null).join('\n'))
   }
   const all = await accounts(paths)
+  if (args.cmd === 'sessions') {
+    const rows = selectableSessions(args.from.map(selector => find(all, selector)), processTable(paths.claudeApp))
+    return args.json ? emit(rows) : out.write(rows.map(row => `${row.token}  ${row.title}  ${row.project}  ${ago(row.activeAt)}${row.running ? ' | running' : ''}`).join('\n') + '\n')
+  }
   if (args.cmd === 'accounts') {
     if (args.json) {
       let recoveryProblem = null
@@ -5422,7 +5493,7 @@ async function main(argv) {
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
       const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? latest.receipt.to : null
-      return emit(all.map(({ account, org, email, orgName, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
+      return emit(all.map(({ account, org, email, orgName, confirmed, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         const waiting = source ? deferred.mode === 'local'
           ? waitingSessions({ held: deferred.receipt.held?.filter(held => held.sources.some(member => sameAccount(member, source))), cloudChecks: deferred.receipt.cloudChecks.filter(check => sameAccount(check, source)) })
@@ -5436,6 +5507,7 @@ async function main(argv) {
           org,
           email,
           orgName,
+          confirmed,
           label,
           stats,
           active,
@@ -5476,6 +5548,7 @@ async function main(argv) {
   }
   if (new Set(from.map((account) => `${account.account}/${account.org}`)).size !== from.length) throw new Error('from accounts must be unique')
   if (from.includes(to)) throw new Error('to must differ from from')
+  if (args.sessions.length) from = selectSessions(from, args.sessions)
   const report = reporter(args.json)
   let cloud = null
   let cloudError = null
