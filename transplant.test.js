@@ -12745,6 +12745,27 @@ struct SkillPickerChecks {
         model.toggle(source.id)
         old.1("[]"); old.2(0, "")
         precondition(model.from.isEmpty && model.skillRows.isEmpty && model.skillResults.isEmpty && !model.loadingSkills)
+        requests = []
+        model.includeLocalSkills = true
+        precondition(requests[0].0 == ["skills", "--json", "--local-skills"])
+        requests[0].1(#"[{"token":"local/local-style/hash","name":"local-style","description":"Local fixture","accountLabel":"This Mac · Claude Code","updatedAt":"2026-01-01","bytes":100,"problem":""}]"#)
+        requests[0].2(0, "")
+        model.selectedSkills = ["local/local-style/hash"]
+        precondition(model.skillsExportReady && !model.skillsReady && model.from.isEmpty)
+        requests = []
+        model.copySkillFiles()
+        precondition(requests[0].0 == ["export-skills", "--json", "--skill", "local/local-style/hash", "--local-skills"])
+        requests[0].1(#"{"files":["/fixture/local-style.zip"]}"#); requests[0].2(0, "")
+        model.selectTarget(target.id)
+        precondition(model.skillsReady && model.from.isEmpty)
+        guard let localImage = Snapshot.data(model) else { fatalError("No local skills image") }
+        try localImage.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))
+        requests = []
+        model.copySkills()
+        precondition(requests[0].0 == ["copy-skills", "--json", "--to", target.selector, "--skill", "local/local-style/hash", "--local-skills"])
+        requests[0].2(1, "Fixture upload unavailable")
+        model.includeLocalSkills = false
+        precondition(model.skillRows.isEmpty && model.selectedSkills.isEmpty && !model.skillsExportReady)
         print("Skills picker passed")
     }
 }
@@ -12788,4 +12809,47 @@ test('skills: duplicate source names and oversized packages are refused before u
   assert.match(oversized[0].problem, /20 MB/)
   await assert.rejects(exportSkills(h.paths, [h.source], [oversized[0].token]), /unavailable/)
   await assert.rejects(copySkills(h.paths, [h.source], h.target, Array(51).fill('invalid')), /between 1 and 50/)
+})
+
+test('skills: shared local skills export and upload without an account source, and never include synced caches or Trash', async () => {
+  const h = await skillFixture(), localRoot = path.join(h.root, '.claude', 'skills')
+  for (const name of ['local-style', 'synced', '.trash']) {
+    await mkdir(path.join(localRoot, name, 'assets'), { recursive: true })
+    await writeFile(path.join(localRoot, name, 'SKILL.md'), `---\nname: ${name}\ndescription: Fixture\n---\nFixture`)
+    await writeFile(path.join(localRoot, name, 'assets', 'data.txt'), 'fixture asset')
+  }
+  assert.deepEqual(await selectableSkills(h.paths, []), [])
+  const rows = await selectableSkills(h.paths, [], true)
+  assert.deepEqual(rows.map(row => row.name), ['local-style'])
+  assert.equal(rows[0].accountLabel, 'This Mac · Claude Code')
+  const listed = await cli(h.root, ['skills', '--local-skills', '--json'])
+  assert.equal(listed.code, 0, listed.stderr)
+  assert.deepEqual(JSON.parse(listed.stdout).map(row => row.token), rows.map(row => row.token))
+  const token = rows[0].token
+  await assert.rejects(exportSkills(h.paths, [], [token]), /unavailable/)
+  const exported = await cli(h.root, ['export-skills', '--local-skills', '--skill', token, '--json'])
+  assert.equal(exported.code, 0, exported.stderr)
+  const zip = JSON.parse(exported.stdout).files[0]
+  const { stdout } = await promisify(execFile)('/usr/bin/unzip', ['-Z1', zip])
+  assert.deepEqual(stdout.trim().split('\n').sort(), ['local-style/SKILL.md', 'local-style/assets/data.txt'])
+  const uploads = []
+  const cloud = { account: h.target.account, org: h.target.org, skills: async () => [], uploadSkill: async name => { uploads.push(name); return { skill: { id: 'copied' } } } }
+  const copied = await copySkills(h.paths, [], h.target, [token], { cloud, local: true })
+  assert.equal(copied.ok, true)
+  assert.deepEqual(uploads, ['local-style'])
+  assert.equal(await readFile(path.join(localRoot, 'local-style/assets/data.txt'), 'utf8'), 'fixture asset')
+  await writeFile(path.join(localRoot, 'local-style/assets/data.txt'), 'changed')
+  await assert.rejects(exportSkills(h.paths, [], [token], { local: true }), /changed/)
+  await symlink(path.join(localRoot, 'local-style'), path.join(localRoot, 'linked'))
+  assert.match((await selectableSkills(h.paths, [], true)).find(row => row.name === 'linked').problem, /symbolic link/)
+  assert.notEqual((await cli(h.root, ['accounts', '--local-skills', '--json'])).code, 0)
+})
+
+test('skills: mixed local and Desktop sources require choosing one version of a duplicate name', async () => {
+  const h = await skillFixture(), source = await h.add('shared-name')
+  await fs.cp(source, path.join(h.root, '.claude/skills/shared-name'), { recursive: true })
+  const rows = await selectableSkills(h.paths, [h.source], true)
+  assert.equal(rows.length, 2)
+  assert.equal(new Set(rows.map(row => row.token)).size, 2)
+  await assert.rejects(exportSkills(h.paths, [h.source], rows.map(row => row.token), { local: true }), /one source/)
 })

@@ -391,6 +391,7 @@ final class Model: ObservableObject {
     @Published var sessionError = ""
     private var sessionRequest = UUID()
     @Published var skillsMode = false { didSet { if skillsMode { loadSkills() } } }
+    @Published var includeLocalSkills = false { didSet { if includeLocalSkills != oldValue { loadSkills(reset: true) } } }
     @Published var skillRows: [SelectableSkill] = []
     @Published var selectedSkills: Set<String> = []
     @Published var skillSearch = ""
@@ -942,18 +943,19 @@ final class Model: ObservableObject {
     }
 
     var skillsReady: Bool { skillsExportReady && to != nil }
-    var skillsExportReady: Bool { skillsMode && canMutate && movable && !from.isEmpty && !loadingSkills && !selectedSkills.isEmpty && (config != nil || demo) }
+    var skillsExportReady: Bool { skillsMode && canMutate && movable && (!from.isEmpty || includeLocalSkills) && !loadingSkills && !selectedSkills.isEmpty && (config != nil || demo) }
+    private var localSkillArguments: [String] { includeLocalSkills ? ["--local-skills"] : [] }
 
     func loadSkills(reset: Bool = false) {
         guard !copyingSkills else { return }
         let request = UUID()
         skillRequest = request
         if reset { skillRows = []; selectedSkills = []; skillError = ""; skillResults = []; skillExportFiles = [] }
-        guard skillsMode, !from.isEmpty, config != nil, !running else { loadingSkills = false; return }
+        guard skillsMode, (!from.isEmpty || includeLocalSkills), config != nil, !running else { loadingSkills = false; return }
         loadingSkills = true
         let sources = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] }
         var text = ""
-        run(["skills", "--json"] + sources, line: { text += $0 }) { [weak self] status, error in
+        run(["skills", "--json"] + sources + localSkillArguments, line: { text += $0 }) { [weak self] status, error in
             guard let self, skillRequest == request else { return }
             loadingSkills = false
             guard status == 0, let rows = try? JSONDecoder().decode([SelectableSkill].self, from: Data(text.utf8)) else {
@@ -975,12 +977,12 @@ final class Model: ObservableObject {
         alert.messageText = "Copy \(quantity(chosen.count, "skill", "skills")) to \(target.label)?"
         alert.informativeText = chosen.prefix(15).map { "• \($0.name) — \($0.accountLabel)" }.joined(separator: "\n")
             + (chosen.count > 15 ? "\n…and \(chosen.count - 15) more." : "")
-            + "\n\nUploads the downloaded copies, including scripts and supporting files, to this Claude account. Sign into the destination first. Originals stay in place; existing names are skipped. Review and enable the copies in Customize → Skills."
+            + "\n\nUploads the selected skills, including scripts and supporting files, to this Claude account. Sign into the destination first. Originals stay in place; existing names are skipped. Review and enable the copies in Customize → Skills."
         alert.addButton(withTitle: "Copy selected skills")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let args = ["copy-skills", "--json"] + accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] }
-            + ["--to", target.selector] + selectedSkills.sorted().flatMap { ["--skill", $0] }
+            + ["--to", target.selector] + selectedSkills.sorted().flatMap { ["--skill", $0] } + localSkillArguments
         copyingSkills = true
         skillError = ""
         skillResults = []
@@ -1004,7 +1006,7 @@ final class Model: ObservableObject {
         skillResults = []
         skillExportFiles = []
         let args = ["export-skills", "--json"] + accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] }
-            + selectedSkills.sorted().flatMap { ["--skill", $0] }
+            + selectedSkills.sorted().flatMap { ["--skill", $0] } + localSkillArguments
         var text = ""
         run(args, line: { text += $0 }) { [weak self] status, error in
             guard let self else { return }
@@ -1896,6 +1898,7 @@ struct Panel: View {
                 Text("\(model.selectedSkills.count) selected").font(.caption).foregroundStyle(.secondary)
             }
             TextField("Search skills", text: $model.skillSearch).textFieldStyle(.roundedBorder).disabled(model.copyingSkills)
+            Toggle("Include local Claude Code skills", isOn: $model.includeLocalSkills).toggleStyle(.checkbox).font(.callout).disabled(model.copyingSkills)
             HStack {
                 Button("Select shown") { model.selectedSkills.formUnion(model.filteredSkills.filter { $0.problem.isEmpty }.map(\.token)) }
                     .disabled(model.loadingSkills || model.filteredSkills.isEmpty)
@@ -1904,10 +1907,10 @@ struct Panel: View {
                 if model.loadingSkills { ProgressView().controlSize(.small) }
                 Button(action: { model.loadSkills() }) { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh skills")
             }.font(.caption).buttonStyle(.plain).disabled(model.copyingSkills)
-            if model.from.isEmpty {
-                Text("Choose a source account to see its downloaded custom skills.").font(.caption).foregroundStyle(.secondary)
+            if model.from.isEmpty && !model.includeLocalSkills {
+                Text("Choose a source account, or include local Claude Code skills.").font(.caption).foregroundStyle(.secondary)
             } else if model.filteredSkills.isEmpty && !model.loadingSkills {
-                Text("No cached custom skills match. Open the source account in Claude to sync its skills, then refresh.")
+                Text("No skills match. Local skills need a SKILL.md in ~/.claude/skills. Open a source account in Claude to sync its Desktop skills, then refresh.")
                     .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             } else {
                 ScrollView {
@@ -1927,7 +1930,7 @@ struct Panel: View {
                     }.padding(.vertical, 3)
                 }.frame(height: min(175, CGFloat(model.filteredSkills.count) * 48))
             }
-            Text("Downloaded custom skills only. Originals stay; existing names are skipped. Local ~/.claude/skills folders are already shared across logins.")
+            Text("Desktop copies and local Code skills. Originals stay; existing names are skipped. Local Code skills already work across logins on this Mac.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let target = model.accounts.first(where: { $0.id == model.to }), target.signedIn != true {
                 Text("Sign Claude Desktop into \(target.name) before copying here.").font(.caption).foregroundStyle(.orange)

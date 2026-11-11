@@ -57,6 +57,7 @@ const HELP = `claude-transplant   move Claude Code history between accounts
   claude-transplant skills --from <match> --json    list cached custom skills
   claude-transplant copy-skills --from <match> --to <match> --skill <token> --json
   claude-transplant export-skills --from <match> --skill <token> --json
+  --local-skills                include shared ~/.claude/skills in skill commands; --from is optional
   claude-transplant restart     plan an explicit Desktop restart
   claude-transplant sweep       verify placed metadata and retry the active pending source
   claude-transplant menubar     install the menubar app, --snapshot <png>, --remove uninstalls
@@ -1151,8 +1152,24 @@ async function skillFiles(root) {
 
 const skillFingerprint = files => sha(files.map(file => `${file.name}\0${file.mode & 0o777}\0${sha(file.data)}`).join('\n'))
 
-export async function selectableSkills(paths, from) {
+export async function selectableSkills(paths, from, includeLocal = false) {
   const rows = []
+  if (includeLocal) {
+    const root = path.join(paths.home, '.claude', 'skills')
+    const entries = await readdir(root, { withFileTypes: true }).catch(error => { if (error.code === 'ENOENT') return []; throw error })
+    for (const entry of entries.filter(entry => SKILL_NAME.test(entry.name) && entry.name !== 'synced' && (entry.isDirectory() || entry.isSymbolicLink()))) {
+      let fingerprint = '', bytes = 0, problem = '', updatedAt = ''
+      try {
+        const files = await skillFiles(path.join(root, entry.name))
+        fingerprint = skillFingerprint(files)
+        bytes = files.reduce((sum, file) => sum + file.data.length, 0)
+        updatedAt = (await stat(path.join(root, entry.name, 'SKILL.md'))).mtime.toISOString()
+      } catch (error) { problem = error.code === 'ENOENT' ? 'Missing SKILL.md or supporting files.' : error.message }
+      rows.push({ token: `local/${entry.name}/${fingerprint}`, name: entry.name, storage: 'local',
+        description: 'Personal Claude Code skill from ~/.claude/skills; shared across logins on this Mac.',
+        accountLabel: 'This Mac · Claude Code', updatedAt, bytes, problem })
+    }
+  }
   for (const source of from) {
     if (!UUID.test(source.account) || !UUID.test(source.org)) throw new Error('Invalid skill account or organization')
     const root = path.join(paths.agentSessions, 'skills-plugin', source.org, source.account)
@@ -1203,9 +1220,9 @@ export function skillArchive(name, files) {
   return Buffer.concat([...locals, directory, end])
 }
 
-async function skillPackages(paths, from, tokens) {
+async function skillPackages(paths, from, tokens, includeLocal = false) {
   if (!tokens.length || tokens.length > 50 || new Set(tokens).size !== tokens.length) throw new Error('Select between 1 and 50 unique skills')
-  const available = await selectableSkills(paths, from)
+  const available = await selectableSkills(paths, from, includeLocal)
   const selected = tokens.map(token => {
     const row = available.find(row => row.token === token)
     if (!row || row.problem) throw new Error('A selected skill changed or is unavailable. Refresh and select it again.')
@@ -1215,7 +1232,8 @@ async function skillPackages(paths, from, tokens) {
   const packages = []
   let total = 0
   for (const row of selected) {
-    const files = await skillFiles(path.join(paths.agentSessions, 'skills-plugin', row.org, row.account, 'skills', row.name))
+    const root = row.storage === 'local' ? path.join(paths.home, '.claude', 'skills', row.name) : path.join(paths.agentSessions, 'skills-plugin', row.org, row.account, 'skills', row.name)
+    const files = await skillFiles(root)
     if (!row.token.endsWith('/' + skillFingerprint(files))) throw new Error('A selected skill changed. Refresh and select it again.')
     total += files.reduce((sum, file) => sum + file.data.length, 0)
     if (total > 50 * 1024 * 1024) throw new Error('Selection exceeds 50 MB. Copy fewer skills at once.')
@@ -1224,8 +1242,8 @@ async function skillPackages(paths, from, tokens) {
   return packages
 }
 
-export async function exportSkills(paths, from, tokens) {
-  const packages = await skillPackages(paths, from, tokens)
+export async function exportSkills(paths, from, tokens, options = {}) {
+  const packages = await skillPackages(paths, from, tokens, options.local)
   const root = path.join(paths.state, 'skill-exports')
   await mkdir(root, { recursive: true, mode: 0o700 })
   const folder = await mkdtemp(path.join(root, 'skills-'))
@@ -1242,7 +1260,7 @@ export async function exportSkills(paths, from, tokens) {
 
 export async function copySkills(paths, from, to, tokens, io = {}) {
   if (!UUID.test(to.account) || !UUID.test(to.org) || from.some(source => sameAccount(source, to))) throw new Error('Choose a different destination account or organization')
-  const packages = await skillPackages(paths, from, tokens)
+  const packages = await skillPackages(paths, from, tokens, io.local)
   const cloud = io.cloud ?? await cloudClient(paths, to)
   if (cloud.account !== to.account || cloud.org !== to.org) throw new Error('Skill destination identity changed')
   const existing = new Set((await cloud.skills()).map(skill => skill.name?.toLowerCase()))
@@ -5402,13 +5420,14 @@ async function menubar(paths, remove, snapshot) {
 }
 
 function parse(argv) {
-  const args = { from: [], sessions: [], skills: [], to: null, cmd: null, dry: false, cloud: false, json: false, help: false, version: false, remove: false, snapshot: null, restartApproved: null, moveOnly: false, leaveChecks: [] }
+  const args = { from: [], sessions: [], skills: [], localSkills: false, to: null, cmd: null, dry: false, cloud: false, json: false, help: false, version: false, remove: false, snapshot: null, restartApproved: null, moveOnly: false, leaveChecks: [] }
   const value = (i) => { if (argv[i] === undefined || argv[i].startsWith('-')) throw new Error(`${argv[i - 1]} needs a value`); return argv[i] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--from') args.from.push(value(++i))
     else if (a === '--session') args.sessions.push(value(++i))
     else if (a === '--skill') args.skills.push(value(++i))
+    else if (a === '--local-skills') args.localSkills = true
     else if (a === '--to') args.to = value(++i)
     else if (a === '--dry-run') args.dry = true
     else if (a === '--cloud') args.cloud = true
@@ -5424,11 +5443,12 @@ function parse(argv) {
     else throw new Error(`unknown argument ${a}`)
   }
   if (['skills', 'copy-skills', 'export-skills'].includes(args.cmd)) {
-    if (!args.from.length || args.sessions.length || args.dry || args.cloud || args.remove || args.snapshot || args.restartApproved || args.moveOnly || args.leaveChecks.length || args.help || args.version ||
+    if ((!args.from.length && !args.localSkills) || args.sessions.length || args.dry || args.cloud || args.remove || args.snapshot || args.restartApproved || args.moveOnly || args.leaveChecks.length || args.help || args.version ||
         (args.cmd === 'skills' ? args.to || args.skills.length : !args.skills.length || (args.cmd === 'copy-skills' ? !args.to : args.to))) throw new Error('Use skills --from <match> --json, copy-skills --from <match> --to <match> --skill <token> --json, or export-skills --from <match> --skill <token> --json')
     return args
   }
   if (args.skills.length) throw new Error('--skill requires copy-skills or export-skills')
+  if (args.localSkills) throw new Error('--local-skills requires skills, copy-skills, or export-skills')
   if (args.cmd !== 'sessions' && (args.from.length > 0) !== Boolean(args.to)) throw new Error('--from and --to go together')
   if (args.cmd === 'sessions' && (!args.from.length || args.to || args.sessions.length || args.dry || args.cloud || args.restartApproved || args.moveOnly)) throw new Error('sessions requires --from and accepts only --json')
   if (args.sessions.length && (args.cmd || !args.from.length || args.cloud)) throw new Error('--session requires --from and --to; selected-session moves are local only, without --cloud')
@@ -5652,10 +5672,10 @@ async function main(argv) {
     ].filter((line) => line !== null).join('\n'))
   }
   const all = await accounts(paths)
-  if (args.cmd === 'skills') return emit(await selectableSkills(paths, args.from.map(selector => find(all, selector))))
-  if (args.cmd === 'export-skills') return emit(await exportSkills(paths, args.from.map(selector => find(all, selector)), args.skills))
+  if (args.cmd === 'skills') return emit(await selectableSkills(paths, args.from.map(selector => find(all, selector)), args.localSkills))
+  if (args.cmd === 'export-skills') return emit(await exportSkills(paths, args.from.map(selector => find(all, selector)), args.skills, { local: args.localSkills }))
   if (args.cmd === 'copy-skills') {
-    const result = await locked(paths, () => copySkills(paths, args.from.map(selector => find(all, selector)), find(all, args.to), args.skills))
+    const result = await locked(paths, () => copySkills(paths, args.from.map(selector => find(all, selector)), find(all, args.to), args.skills, { local: args.localSkills }))
     if (!result.ok) process.exitCode = 1
     return emit(result)
   }

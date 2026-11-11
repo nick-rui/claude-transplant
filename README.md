@@ -10,7 +10,7 @@ With Node 22 or newer and the Xcode command-line tools installed, run this from 
 node transplant.js menubar
 ```
 
-This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel shows version **4.2.1-nick.6**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
+This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel shows version **4.2.1-nick.7**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
 
 ## Choose what to move
 
@@ -42,24 +42,26 @@ Remove `--dry-run` to perform the selected move. Repeat `--session` for multiple
 
 ## Copy skills
 
-Choose **Skills** above the account columns. Select source accounts, search, and check individual custom skills. Nothing is selected automatically. Each row identifies its source; select only one source per skill name.
+Choose **Skills** above the account columns. Select source accounts and/or turn on **Include local Claude Code skills**, search, and check individual skills. Local rows are labeled **This Mac · Claude Code**, and do not require a source account. Nothing is selected automatically. Each row identifies its source; select only one source per skill name.
 
 - **Copy ZIP files** exports complete skill packages and places their file URLs on the macOS clipboard. Use **Show ZIPs in Finder**, then upload the ZIPs in the destination account's **Customize → Skills**. No login access is needed for export; export alone does not upload anything. Each click saves a new private folder under `~/Library/Application Support/claude-transplant/skill-exports/`. These files stay available until you remove them in Finder; they are outside this repository.
 - **Copy N skills to account** uploads the selected packages directly. Sign Claude Desktop into the destination account first. This verifies the authenticated account and organization, skips names already present, and sends `overwrite=false` and `auto_enable=never`. Review the copies in Customize → Skills before enabling them. Originals are never removed. This uses an undocumented Claude endpoint and requires access to Desktop's saved login, which macOS Keychain may prevent; use ZIP export if direct copying fails. A timeout can leave the outcome uncertain, so check the destination before retrying. Partial results are shown individually and uploads stop after the first failure.
 
-The source is the **downloaded cache**, not a live inventory: `~/Library/Application Support/Claude/local-agent-mode-sessions/skills-plugin/ORG_UUID/ACCOUNT_UUID/`. Only entries marked `creatorType: user` with a readable `SKILL.md` are selectable; built-in skills are omitted. A missing or outdated skill needs a sync while signed into its source account. Uploads include scripts and supporting files, preserve executable permissions, reject symlinks, and refuse selections whose contents changed after selection. Limits are 20 MB and 1,000 entries per skill, 50 skills and 50 MB per selection.
+For Desktop account skills, the source is the **downloaded cache**, not a live inventory: `~/Library/Application Support/Claude/local-agent-mode-sessions/skills-plugin/ORG_UUID/ACCOUNT_UUID/`. Only entries marked `creatorType: user` with a readable `SKILL.md` are selectable; built-in skills are omitted. A missing or outdated skill needs a sync while signed into its source account. Uploads include scripts and supporting files, preserve executable permissions, reject symlinks, and refuse selections whose contents changed after selection. Limits are 20 MB and 1,000 entries per skill, 50 skills and 50 MB per selection.
 
-Regular `~/.claude/skills/` folders are already shared by logins using the same Mac user. The account-bound `synced/` folders are downloaded copies; changing those files does not upload them. See [Claude's skill-sync documentation](https://code.claude.com/docs/en/skills) and [custom-skill upload instructions](https://support.claude.com/en/articles/12512180-use-skills-in-claude).
+Regular `~/.claude/skills/` folders are already shared by logins using the same Mac user. The local toggle includes those personal skill folders for ZIP export or upload into a Desktop account; it excludes hidden folders, Trash, and `synced/`. Project-specific skill folders and symlinked skills are not included. Selecting the local toggle never selects skills automatically. The account-bound `synced/` folders are downloaded copies; changing those files does not upload them. See [Claude's skill-sync documentation](https://code.claude.com/docs/en/skills) and [custom-skill upload instructions](https://support.claude.com/en/articles/12512180-use-skills-in-claude).
 
 Cache layout and upload request format were inspected in Claude Desktop **5.1231.0**. Upload tests use mocked responses; no live skill uploads were performed. The live read-only login check on the development Mac could not access Claude Safe Storage, so direct upload has not been verified end-to-end there. ZIP structure is validated with macOS's archive reader.
 
 ```sh
 node transplant.js skills --from 'ACCOUNT_UUID ORG_UUID' --json
+node transplant.js skills --local-skills --json
+node transplant.js export-skills --local-skills --skill 'LOCAL_TOKEN_FROM_LIST' --json
 node transplant.js export-skills --from 'ACCOUNT_UUID ORG_UUID' --skill 'TOKEN_FROM_LIST' --json
 node transplant.js copy-skills --from 'ACCOUNT_UUID ORG_UUID' --to 'OTHER_ACCOUNT_UUID OTHER_ORG_UUID' --skill 'TOKEN_FROM_LIST' --json
 ```
 
-Repeat `--skill` for multiple selections. Skill copying is separate from session moves and their Undo workflow; manage uploaded copies in Claude's Skills page.
+Repeat `--skill` for multiple selections. Add `--local-skills` to any skill command to include personal Code skills, with or without `--from`. Skill copying is separate from session moves and their Undo workflow; manage uploaded copies in Claude's Skills page.
 
 ## Validation
 
