@@ -66,6 +66,33 @@ struct Config: Decodable {
     func arguments(_ args: [String]) -> [String] { (nodeArgs ?? []) + [script] + args }
 }
 
+struct SelectableSkill: Decodable, Identifiable {
+    let token: String
+    let name: String
+    let description: String
+    let accountLabel: String
+    let updatedAt: String
+    let bytes: Int
+    let problem: String
+    var id: String { token }
+}
+
+struct SkillCopyResult: Decodable {
+    struct Item: Decodable, Identifiable {
+        let token: String
+        let name: String
+        let status: String
+        let detail: String
+        var id: String { token }
+    }
+    let ok: Bool
+    let results: [Item]
+}
+
+struct SkillExport: Decodable {
+    let files: [String]
+}
+
 struct Failure: Decodable {
     let id: String?
     let sessionId: String?
@@ -327,7 +354,7 @@ struct AccountDrag {
 @MainActor
 final class Model: ObservableObject {
     @Published var accounts: [Account] = []
-    @Published var from: Set<String> = [] { didSet { if from != oldValue { loadSessions(reset: true) } } }
+    @Published var from: Set<String> = [] { didSet { if from != oldValue { loadSessions(reset: true); loadSkills(reset: true) } } }
     @Published var to: String?
     @Published var excluded: Set<String> = []
     @Published var lanes: [String: String] = [:]
@@ -363,6 +390,16 @@ final class Model: ObservableObject {
     @Published var loadingSessions = false
     @Published var sessionError = ""
     private var sessionRequest = UUID()
+    @Published var skillsMode = false { didSet { if skillsMode { loadSkills() } } }
+    @Published var skillRows: [SelectableSkill] = []
+    @Published var selectedSkills: Set<String> = []
+    @Published var skillSearch = ""
+    @Published var loadingSkills = false
+    @Published var copyingSkills = false
+    @Published var skillError = ""
+    @Published var skillResults: [SkillCopyResult.Item] = []
+    @Published var skillExportFiles: [URL] = []
+    private var skillRequest = UUID()
     var snapshotFailed = false
     let snapshot: Bool
     let demo: Bool
@@ -410,7 +447,7 @@ final class Model: ObservableObject {
         refresh()
         checkForUpdate()
         poller = Timer.publish(every: 15, on: .main, in: .common).autoconnect().sink { [weak self] _ in
-            guard let self, !self.running, !self.sweeping else { return }
+            guard let self, !self.running, !self.sweeping, !self.copyingSkills else { return }
             self.refresh()
         }
         updateTimer = Timer.publish(every: 6 * 3600, on: .main, in: .common).autoconnect().sink { [weak self] _ in self?.checkForUpdate() }
@@ -528,7 +565,7 @@ final class Model: ObservableObject {
     }
     var activePendingAccount: Account? { pendingAccounts.first { $0.active == true } }
     var recoveryProblem: RecoveryProblem? { accounts.compactMap(\.recoveryProblem).first }
-    var canMutate: Bool { !running && !updating && recoveryProblem == nil && !recoveryBlocked }
+    var canMutate: Bool { !running && !updating && !copyingSkills && recoveryProblem == nil && !recoveryBlocked }
     var undoPending: Bool { pendingAccounts.contains { $0.pending == "undo" } }
     var directActions: Bool { screen == .blocked }
     var canKeepLocal: Bool { canMutate && (partialResult || pendingAccounts.contains { ["cloud", "local", "partial"].contains($0.pending ?? "") }) }
@@ -622,6 +659,7 @@ final class Model: ObservableObject {
     }
     private func oldCopies(_ account: Account) -> String { account.pendingCount.map { quantity($0, "old copy", "old copies") } ?? "Old copies" }
     var primaryTitle: String? {
+        if skillsMode { return nil }
         guard canMutate else { return nil }
         if stopped && !operationArgs.isEmpty && continuationArgs.isEmpty { return nil }
         if reviewRestart && !operationArgs.isEmpty { return restartReviewTitle }
@@ -721,7 +759,7 @@ final class Model: ObservableObject {
     func canSource(_ account: Account) -> Bool { account.id != to }
 
     func toggle(_ id: String) {
-        guard !running, let account = accounts.first(where: { $0.id == id }), canSource(account) else { return }
+        guard !running, !copyingSkills, let account = accounts.first(where: { $0.id == id }), canSource(account) else { return }
         if selectionComplete { excluded = Set(accounts.map(\.id)) }
         clearResult()
         if from.contains(id) { excluded.insert(id) } else { excluded.remove(id) }
@@ -729,9 +767,11 @@ final class Model: ObservableObject {
     }
 
     func selectTarget(_ id: String) {
-        guard !running else { return }
+        guard !running, !copyingSkills else { return }
         let selectedSources = from
         clearResult()
+        skillResults = []
+        skillError = ""
         if let old = to, old != id, let vacated = lanes.first(where: { $0.value == old })?.key, let taken = lanes.first(where: { $0.value == id })?.key {
             lanes[vacated] = id
             lanes[taken] = old
@@ -743,7 +783,7 @@ final class Model: ObservableObject {
     }
 
     func reset() {
-        guard !running, !updating, movable else { return }
+        guard !running, !updating, !copyingSkills, movable else { return }
         dismiss()
         clearResult()
         completion = nil
@@ -895,6 +935,88 @@ final class Model: ObservableObject {
 
     func selectShownSessions() {
         selectedSessions.formUnion(filteredSessions.flatMap(\.related))
+    }
+
+    var filteredSkills: [SelectableSkill] {
+        skillRows.filter { skillSearch.isEmpty || "\($0.name) \($0.description) \($0.accountLabel)".localizedCaseInsensitiveContains(skillSearch) }
+    }
+
+    var skillsReady: Bool { skillsExportReady && to != nil }
+    var skillsExportReady: Bool { skillsMode && canMutate && movable && !from.isEmpty && !loadingSkills && !selectedSkills.isEmpty && (config != nil || demo) }
+
+    func loadSkills(reset: Bool = false) {
+        guard !copyingSkills else { return }
+        let request = UUID()
+        skillRequest = request
+        if reset { skillRows = []; selectedSkills = []; skillError = ""; skillResults = []; skillExportFiles = [] }
+        guard skillsMode, !from.isEmpty, config != nil, !running else { loadingSkills = false; return }
+        loadingSkills = true
+        let sources = accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] }
+        var text = ""
+        run(["skills", "--json"] + sources, line: { text += $0 }) { [weak self] status, error in
+            guard let self, skillRequest == request else { return }
+            loadingSkills = false
+            guard status == 0, let rows = try? JSONDecoder().decode([SelectableSkill].self, from: Data(text.utf8)) else {
+                skillRows = []; selectedSkills = []; skillError = error.isEmpty ? "Could not read skills. Refresh to try again." : error
+                return
+            }
+            skillRows = rows
+            selectedSkills.formIntersection(Set(rows.filter { $0.problem.isEmpty }.map(\.token)))
+            skillError = ""
+        }
+    }
+
+    func copySkills() {
+        guard skillsReady, let target = accounts.first(where: { $0.id == to }) else { return }
+        let chosen = skillRows.filter { selectedSkills.contains($0.token) && $0.problem.isEmpty }
+        guard chosen.count == selectedSkills.count else { loadSkills(reset: true); return }
+        guard Set(chosen.map(\.name)).count == chosen.count else { skillError = "Choose only one source for each skill name."; return }
+        let alert = NSAlert()
+        alert.messageText = "Copy \(quantity(chosen.count, "skill", "skills")) to \(target.label)?"
+        alert.informativeText = chosen.prefix(15).map { "• \($0.name) — \($0.accountLabel)" }.joined(separator: "\n")
+            + (chosen.count > 15 ? "\n…and \(chosen.count - 15) more." : "")
+            + "\n\nUploads the downloaded copies, including scripts and supporting files, to this Claude account. Sign into the destination first. Originals stay in place; existing names are skipped. Review and enable the copies in Customize → Skills."
+        alert.addButton(withTitle: "Copy selected skills")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let args = ["copy-skills", "--json"] + accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] }
+            + ["--to", target.selector] + selectedSkills.sorted().flatMap { ["--skill", $0] }
+        copyingSkills = true
+        skillError = ""
+        skillResults = []
+        var text = ""
+        run(args, line: { text += $0 }) { [weak self] status, error in
+            guard let self else { return }
+            copyingSkills = false
+            if let result = try? JSONDecoder().decode(SkillCopyResult.self, from: Data(text.utf8)) {
+                skillResults = result.results
+                selectedSkills.subtract(result.results.filter { ["copied", "skipped"].contains($0.status) }.map(\.token))
+            } else {
+                skillError = error.isEmpty ? "Copy outcome is unknown. Check Customize → Skills before retrying." : error
+            }
+        }
+    }
+
+    func copySkillFiles() {
+        guard skillsExportReady else { return }
+        copyingSkills = true
+        skillError = ""
+        skillResults = []
+        skillExportFiles = []
+        let args = ["export-skills", "--json"] + accounts.filter { from.contains($0.id) }.flatMap { ["--from", $0.selector] }
+            + selectedSkills.sorted().flatMap { ["--skill", $0] }
+        var text = ""
+        run(args, line: { text += $0 }) { [weak self] status, error in
+            guard let self else { return }
+            copyingSkills = false
+            guard status == 0, let result = try? JSONDecoder().decode(SkillExport.self, from: Data(text.utf8)), !result.files.isEmpty else {
+                skillError = error.isEmpty ? "Could not export the skills. Refresh and try again." : error
+                return
+            }
+            skillExportFiles = result.files.map { URL(fileURLWithPath: $0) }
+            NSPasteboard.general.clearContents()
+            if !NSPasteboard.general.writeObjects(skillExportFiles as [NSURL]) { skillError = "ZIPs were saved. Use Show ZIPs to copy them from Finder." }
+        }
     }
 
     func undo() {
@@ -1633,9 +1755,16 @@ struct Panel: View {
                 if let label = model.identityLabel { Text(label).font(.caption).foregroundStyle(.secondary) }
                 Spacer()
                 Button(action: { model.reset() }) { Image(systemName: "arrow.clockwise") }.buttonStyle(.plain).foregroundStyle(.secondary)
-                    .accessibilityLabel("Reset").help("Clear account selections").disabled(model.running || model.updating || !model.movable)
+                    .accessibilityLabel("Reset").help("Clear account selections").disabled(!model.canMutate || !model.movable)
             }
+            Picker("Transfer type", selection: $model.skillsMode) {
+                Text("Sessions").tag(false)
+                Text("Skills").tag(true)
+            }.pickerStyle(.segmented).labelsHidden().disabled(!model.canMutate)
             accountBoard.disabled(!model.canMutate || !model.movable)
+            if model.skillsMode {
+                skillPicker
+            } else {
             if model.movable && !model.from.isEmpty && !model.running {
                 sessionPicker.disabled(!model.canMutate)
             }
@@ -1665,9 +1794,10 @@ struct Panel: View {
                 Button(action: { model.restartDesktop() }) { Text("Restart Claude").font(.callout.weight(.medium)).underline() }.buttonStyle(.plain)
                     .disabled(!model.canMutate)
             }
+            }
             HStack(spacing: 10) {
                 if let title = model.primaryTitle { Pill(title: title, prominent: true, enabled: true) { model.primary() } }
-                if model.directActions {
+                if model.directActions && !model.skillsMode {
                     if model.canKeepLocal {
                         Pill(title: "Keep moved sessions", prominent: false, enabled: true) { model.stopHere() }
                     }
@@ -1677,10 +1807,10 @@ struct Panel: View {
                     }
                 }
                 Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary).fixedSize()
+                Button("Quit") { NSApplication.shared.terminate(nil) }.buttonStyle(.plain).foregroundStyle(.secondary).fixedSize().disabled(model.copyingSkills)
             }
             HStack(spacing: 12) {
-                ForEach(model.links, id: \.title) { link in
+                ForEach(model.skillsMode ? [] : model.links, id: \.title) { link in
                     Button(link.title) { link.action() }.buttonStyle(.plain).font(.caption).foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -1754,6 +1884,83 @@ struct Panel: View {
             }
             Text("Local Code sessions only; cloud copies are kept. Linked sessions are selected together, including matches outside the current filter.")
                 .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var skillPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+            HStack {
+                Text("Choose skills to copy").font(.callout.weight(.semibold))
+                Spacer()
+                Text("\(model.selectedSkills.count) selected").font(.caption).foregroundStyle(.secondary)
+            }
+            TextField("Search skills", text: $model.skillSearch).textFieldStyle(.roundedBorder).disabled(model.copyingSkills)
+            HStack {
+                Button("Select shown") { model.selectedSkills.formUnion(model.filteredSkills.filter { $0.problem.isEmpty }.map(\.token)) }
+                    .disabled(model.loadingSkills || model.filteredSkills.isEmpty)
+                Button("Clear selection") { model.selectedSkills = [] }.disabled(model.selectedSkills.isEmpty)
+                Spacer()
+                if model.loadingSkills { ProgressView().controlSize(.small) }
+                Button(action: { model.loadSkills() }) { Image(systemName: "arrow.clockwise") }.accessibilityLabel("Refresh skills")
+            }.font(.caption).buttonStyle(.plain).disabled(model.copyingSkills)
+            if model.from.isEmpty {
+                Text("Choose a source account to see its downloaded custom skills.").font(.caption).foregroundStyle(.secondary)
+            } else if model.filteredSkills.isEmpty && !model.loadingSkills {
+                Text("No cached custom skills match. Open the source account in Claude to sync its skills, then refresh.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 10) {
+                        ForEach(model.filteredSkills) { skill in
+                            Toggle(isOn: Binding(get: { model.selectedSkills.contains(skill.token) }, set: { selected in
+                                if selected { model.selectedSkills.insert(skill.token) } else { model.selectedSkills.remove(skill.token) }
+                            })) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(skill.name).font(.callout).lineLimit(1)
+                                    Text(skill.accountLabel).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    if !skill.problem.isEmpty { Text(skill.problem).font(.caption).foregroundStyle(.orange) }
+                                }
+                            }.toggleStyle(.checkbox).disabled(model.copyingSkills || !skill.problem.isEmpty)
+                                .help("\(skill.description)\nUpdated: \(skill.updatedAt)\n\(ByteCountFormatter.string(fromByteCount: Int64(skill.bytes), countStyle: .file)) including supporting files")
+                        }
+                    }.padding(.vertical, 3)
+                }.frame(height: min(175, CGFloat(model.filteredSkills.count) * 48))
+            }
+            Text("Downloaded custom skills only. Originals stay; existing names are skipped. Local ~/.claude/skills folders are already shared across logins.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let target = model.accounts.first(where: { $0.id == model.to }), target.signedIn != true {
+                Text("Sign Claude Desktop into \(target.name) before copying here.").font(.caption).foregroundStyle(.orange)
+            }
+            if !model.movable { Text("Finish the pending session move first.").font(.caption).foregroundStyle(.orange) }
+            if !model.skillError.isEmpty {
+                Text(model.skillError).font(.caption).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+            }
+            if model.copyingSkills {
+                HStack { ProgressView().controlSize(.small); Text("Copying skills…").font(.callout) }
+            } else if model.skillsExportReady {
+                HStack {
+                    if model.skillsReady {
+                        Pill(title: "Copy \(model.selectedSkills.count) \(model.selectedSkills.count == 1 ? "skill" : "skills") to account", prominent: true, enabled: true) { model.copySkills() }
+                    }
+                    Pill(title: "Copy ZIP files", prominent: false, enabled: true) { model.copySkillFiles() }
+                }
+            }
+            if !model.skillExportFiles.isEmpty {
+                Text("ZIP files copied. In the destination’s Customize → Skills, choose Upload a skill and select these ZIPs. No skills have been uploaded yet.")
+                    .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                Button("Show ZIPs in Finder") { NSWorkspace.shared.activateFileViewerSelecting(model.skillExportFiles) }.font(.caption).buttonStyle(.plain)
+            }
+            if !model.skillResults.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(model.skillResults) { result in
+                            Text("\(result.name): \(result.detail)").font(.caption)
+                                .foregroundStyle(["copied", "skipped"].contains(result.status) ? Color.secondary : Color.orange)
+                        }
+                    }.frame(maxWidth: .infinity, alignment: .leading)
+                }.frame(height: min(110, CGFloat(model.skillResults.count) * 42))
+            }
         }
     }
 

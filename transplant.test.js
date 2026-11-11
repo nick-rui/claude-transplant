@@ -11,7 +11,7 @@ import test from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { accounts, cloudClient, conversation, conversationMatch, executeMove, finishHeld, finishPending, finishWorkflow, idleTimeouts, inventory, keepLocal, layout, memoryBudget, menubarHeapMiB, move, normalize, parseProcesses, pendingPresentation, readReceipt, receiptSummary, restartPlan, semantic, signedIn, step, sweep, undo, verifyPlaced, withDesktopRestart, writeNew } from './transplant.js'
-import { selectableSessions, selectSessions } from './transplant.js'
+import { selectableSessions, selectSessions, selectableSkills, copySkills, skillArchive, exportSkills } from './transplant.js'
 
 const here = path.dirname(fileURLToPath(import.meta.url))
 const fixtureCommand = run => (file, ...args) => {
@@ -9869,14 +9869,18 @@ async function swiftFixtureSource(selectFixtureSessions = true) {
     }
 
 ` + source.slice(promptEnd)
-  return source.replace('guard alert.runModal() == .alertFirstButtonReturn else { return }', 'guard selectionDialogResponse == .alertFirstButtonReturn else { return }').replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
+  return source.replaceAll('guard alert.runModal() == .alertFirstButtonReturn else { return }', 'guard selectionDialogResponse == .alertFirstButtonReturn else { return }').replace('guard canMutate, !sweeping, !snapshot else { return }', 'guard canMutate, !sweeping else { return }')
     .replace('if !snapshot && (changed || panelOpen || !pendingAccounts.isEmpty)', 'if automaticRefreshFixture && (changed || panelOpen || !pendingAccounts.isEmpty)')
     .replace('DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in', 'scheduleBadgeReset { [weak self] in')
     .replace('if demo || snapshot { return }', 'notices.append(title)\n        if demo || snapshot { return }')
     .replace('    private let config: Config?', '    var config: Config?')
     .replace('static let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String', 'static let version: String? = "4.2.1"')
     .replace('probe.arguments = ["-lc", "command -v node"]', 'probe.arguments = ["-c", "echo /fixture/found/bin/node"]')
+    .replace('NSPasteboard.general.clearContents()', 'fixtureSkillFiles = []')
+    .replace('NSPasteboard.general.writeObjects(skillExportFiles as [NSURL])', 'fixtureWriteSkillFiles(skillExportFiles)')
     .replaceAll('UserDefaults.standard', 'fixtureDefaults') + String.raw`
+@MainActor var fixtureSkillFiles: [URL] = []
+@MainActor func fixtureWriteSkillFiles(_ files: [URL]) -> Bool { fixtureSkillFiles = files; return true }
 @MainActor final class FixtureDefaults {
     var values: [String: Any] = [:]
     func bool(forKey key: String) -> Bool { values[key] as? Bool ?? false }
@@ -12551,4 +12555,237 @@ struct OptionalSelectionChecks {
   await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
   const { stdout } = await promisify(execFile)(binary, [], { timeout: 15_000 })
   assert.match(stdout, /Optional selection passed/)
+})
+
+async function skillFixture() {
+  const h = await home()
+  const all = await accounts(h.paths, [])
+  const source = all.find(a => a.account === h.acct.P), target = all.find(a => a.account === h.acct.T)
+  const root = path.join(h.paths.agentSessions, 'skills-plugin', source.org, source.account)
+  const manifest = { lastUpdated: '2026-01-02T00:00:00Z', skills: [] }
+  const add = async (name, creatorType = 'user') => {
+    const folder = path.join(root, 'skills', name)
+    await mkdir(path.join(folder, 'scripts'), { recursive: true })
+    await writeFile(path.join(folder, 'SKILL.md'), `---\nname: ${name}\ndescription: A fixture skill\n---\n# Fixture\n`)
+    await writeFile(path.join(folder, 'scripts', 'run.sh'), 'echo fixture\n', { mode: 0o755 })
+    manifest.skills.push({ name, skillId: `skill_${name}`, creatorType, updatedAt: '2026-01-01T00:00:00Z', description: 'Fixture description' })
+    await writeFile(path.join(root, 'manifest.json'), JSON.stringify(manifest))
+    return folder
+  }
+  return { ...h, source, target, cacheRoot: root, manifest, add }
+}
+
+test('skills: list only cached custom skills in the requested account and organization', async () => {
+  const h = await skillFixture()
+  await h.add('custom')
+  await h.add('built-in', 'anthropic')
+  const rows = await selectableSkills(h.paths, [h.source])
+  assert.deepEqual(rows.map(row => row.name), ['custom'])
+  assert.ok(rows[0].token.startsWith(`${h.source.account}/${h.source.org}/skill_custom/`))
+  assert.equal(rows[0].problem, '')
+  assert.deepEqual(await selectableSkills(h.paths, [h.target]), [])
+  const listed = await cli(h.root, ['skills', '--from', h.source.account, '--json'])
+  assert.equal(listed.code, 0, listed.stderr)
+  assert.deepEqual(JSON.parse(listed.stdout).map(row => row.name), ['custom'])
+  for (const args of [['copy-skills', '--from', h.source.account, '--to', h.target.account], ['skills', '--from', h.source.account, '--skill', 'oops'], ['--skill', 'oops']]) {
+    assert.notEqual((await cli(h.root, args)).code, 0)
+  }
+})
+
+test('skills: copy preserves complete packages and source files, skips existing destination names', async () => {
+  const h = await skillFixture(), folder = await h.add('custom')
+  await h.add('existing')
+  const before = await readFile(path.join(folder, 'SKILL.md'))
+  const rows = await selectableSkills(h.paths, [h.source]), uploads = []
+  const cloud = { account: h.target.account, org: h.target.org, skills: async () => [{ name: 'existing' }], uploadSkill: async (name, zip) => {
+    uploads.push(name)
+    const archive = path.join(h.root, 'test.skill')
+    await writeFile(archive, zip)
+    const { stdout } = await promisify(execFile)('/usr/bin/unzip', ['-Z1', archive])
+    assert.deepEqual(stdout.trim().split('\n').sort(), ['custom/SKILL.md', 'custom/scripts/run.sh'])
+    await promisify(execFile)('/usr/bin/unzip', ['-t', archive])
+    const content = await promisify(execFile)('/usr/bin/unzip', ['-p', archive, 'custom/SKILL.md'])
+    assert.equal(content.stdout, before.toString())
+    const modes = await promisify(execFile)('/usr/bin/unzip', ['-Z', '-l', archive])
+    assert.match(modes.stdout, /-rwxr-xr-x.*custom\/scripts\/run.sh/)
+    return { skill: { id: 'new-skill' }, scan_requested: true }
+  } }
+  const result = await copySkills(h.paths, [h.source], h.target, rows.map(row => row.token), { cloud })
+  assert.equal(result.ok, true)
+  assert.deepEqual(uploads, ['custom'])
+  assert.deepEqual(result.results.map(row => row.status), ['copied', 'skipped'])
+  assert.match(result.results[0].detail, /reviewing/)
+  assert.deepEqual(await readFile(path.join(folder, 'SKILL.md')), before)
+  assert.deepEqual(await selectableSkills(h.paths, [h.target]), [])
+})
+
+test('skills: changed selections, symbolic links, unsupported paths, and wrong identities never upload', async () => {
+  const h = await skillFixture(), folder = await h.add('custom')
+  const rows = await selectableSkills(h.paths, [h.source])
+  const cloud = { account: h.target.account, org: h.target.org, skills: async () => { throw new Error('must not reach network') } }
+  await writeFile(path.join(folder, 'scripts', 'run.sh'), 'echo changed\n')
+  await assert.rejects(copySkills(h.paths, [h.source], h.target, [rows[0].token], { cloud }), /changed/)
+  await symlink(h.paths.login, path.join(folder, 'credentials'))
+  const linked = await selectableSkills(h.paths, [h.source])
+  assert.match(linked[0].problem, /symbolic link/)
+  await assert.rejects(copySkills(h.paths, [h.source], h.target, [linked[0].token], { cloud }), /unavailable/)
+  await unlink(path.join(folder, 'credentials'))
+  const current = await selectableSkills(h.paths, [h.source])
+  await assert.rejects(copySkills(h.paths, [h.source], h.target, [current[0].token], { cloud: { ...cloud, account: h.source.account } }), /identity changed/)
+  await assert.rejects(copySkills(h.paths, [h.source], h.source, [current[0].token], { cloud }), /different destination/)
+  await assert.rejects(copySkills(h.paths, [h.source], h.target, [], { cloud }), /Select/)
+  await assert.rejects(copySkills(h.paths, [h.source], h.target, [current[0].token, current[0].token], { cloud }), /unique/)
+  h.manifest.skills.push({ name: '../escape', skillId: 'unsafe', creatorType: 'user' })
+  await writeFile(path.join(h.cacheRoot, 'manifest.json'), JSON.stringify(h.manifest))
+  assert.equal((await selectableSkills(h.paths, [h.source])).length, 1)
+})
+
+test('skills: partial uploads and validation failures are reported without retrying or overwriting', async () => {
+  const h = await skillFixture()
+  for (const name of ['first', 'second', 'third']) await h.add(name)
+  const rows = await selectableSkills(h.paths, [h.source]), uploads = []
+  const cloud = { account: h.target.account, org: h.target.org, skills: async () => [], uploadSkill: async name => {
+    uploads.push(name)
+    if (name === 'second') throw new Error('Connection lost; outcome unknown')
+    return { skill: { id: name } }
+  } }
+  const result = await copySkills(h.paths, [h.source], h.target, rows.map(row => row.token), { cloud })
+  assert.equal(result.ok, false)
+  assert.deepEqual(uploads, ['first', 'second'])
+  assert.deepEqual(result.results.map(row => row.status), ['copied', 'failed', 'not-copied'])
+  const failed = await copySkills(h.paths, [h.source], h.target, [rows[0].token], { cloud: { ...cloud, uploadSkill: async () => ({ validation_errors: [{ message: 'invalid' }] }) } })
+  assert.equal(failed.ok, false)
+  assert.match(failed.results[0].detail, /rejected/)
+})
+
+test('skills: authenticated upload is scoped to verified account and org with overwrite disabled', async t => {
+  const h = await home(), requests = []
+  const zip = skillArchive('fixture', [{ name: 'SKILL.md', data: Buffer.from('fixture'), mode: 0o644 }])
+  t.mock.method(globalThis, 'fetch', async (url, options) => {
+    const endpoint = new URL(url)
+    requests.push(endpoint.pathname)
+    if (endpoint.pathname === '/api/account') return Response.json({ uuid: h.acct.P })
+    if (endpoint.pathname === '/api/organizations') return Response.json([{ uuid: h.org.P }])
+    assert.equal(options.headers['x-organization-uuid'], h.org.P)
+    if (endpoint.pathname.endsWith('/list-skills')) return Response.json({ skills: [{ name: 'existing' }] })
+    assert.equal(endpoint.pathname, `/api/organizations/${h.org.P}/skills/upload-skill`)
+    assert.equal(options.method, 'POST')
+    assert.equal(endpoint.searchParams.get('overwrite'), 'false')
+    assert.equal(endpoint.searchParams.get('auto_enable'), 'never')
+    assert.equal(endpoint.searchParams.get('check_skill_name'), 'fixture')
+    const file = options.body.get('file')
+    assert.equal(file.name, 'fixture.skill')
+    assert.deepEqual(Buffer.from(await file.arrayBuffer()), zip)
+    return Response.json({ skill: { id: 'copied' } })
+  })
+  const io = { active: { account: h.acct.P, org: h.org.P, state: 'known' }, cookies: new Map([['sessionKey', 'fixture']]), userAgent: 'fixture' }
+  const cloud = await cloudClient(h.paths, { account: h.acct.P, org: h.org.P }, io)
+  assert.deepEqual(await cloud.skills(), [{ name: 'existing' }])
+  assert.equal((await cloud.uploadSkill('fixture', zip)).skill.id, 'copied')
+  assert.deepEqual(requests.slice(0, 2), ['/api/account', '/api/organizations'])
+  await assert.rejects(cloudClient(h.paths, { account: h.acct.T, org: h.org.T }, io), /sign Claude Desktop into/)
+})
+
+test('skills: Swift picker isolates session actions, binds selection, handles failure, and clears stale results', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-skills-ui-'))
+  const source = await swiftFixtureSource(false) + String.raw`
+@main
+struct SkillPickerChecks {
+    @MainActor static func main() throws {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        let source = Account(account: "source", org: "personal", email: "personal@example.com", orgName: "Personal", label: "personal@example.com · Personal", active: false, signedIn: false, activeAt: 100, pending: nil, pendingFailures: nil, confirmed: true, sessions: 3)
+        let target = Account(account: "target", org: "work", email: "work@example.com", orgName: "Team", label: "work@example.com · Team", active: true, signedIn: true, activeAt: 1, pending: nil, pendingFailures: nil, confirmed: true, sessions: 0)
+        let model = Model(demo: [source, target])
+        if model.to != target.id { model.selectTarget(target.id) }
+        if !model.from.contains(source.id) { model.toggle(source.id) }
+        model.skillsMode = true
+        precondition(model.primaryTitle == nil && !model.skillsReady)
+        let row = SelectableSkill(token: "source/personal/fixture/hash", name: "write-research", description: "Research writing style", accountLabel: source.label, updatedAt: "2026-01-01", bytes: 100, problem: "")
+        model.skillRows = [row]
+        model.selectedSkills = [row.token]
+        precondition(model.skillsReady && model.primaryTitle == nil)
+        model.skillSearch = "RESEARCH"
+        precondition(model.filteredSkills.count == 1)
+        model.skillSearch = "unmatched"
+        precondition(model.filteredSkills.isEmpty && model.selectedSkills.count == 1)
+        model.skillSearch = ""
+        guard let image = Snapshot.data(model) else { fatalError("No skills image") }
+        try image.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))
+        requests = []
+        selectionDialogResponse = .alertSecondButtonReturn
+        model.copySkills()
+        precondition(requests.isEmpty && !model.copyingSkills)
+        selectionDialogResponse = .alertFirstButtonReturn
+        model.copySkills()
+        precondition(model.copyingSkills && !model.canMutate && requests.count == 1)
+        precondition(requests[0].0 == ["copy-skills", "--json", "--from", source.selector, "--to", target.selector, "--skill", row.token])
+        model.selectTarget(source.id)
+        precondition(model.to == target.id)
+        requests[0].2(1, "Sign into target")
+        precondition(!model.copyingSkills && model.skillError == "Sign into target" && model.selectedSkills == [row.token])
+        model.skillError = ""
+        requests = []
+        model.copySkills()
+        requests[0].1(#"{"ok":true,"results":[{"token":"source/personal/fixture/hash","name":"write-research","status":"copied","detail":"Copied"}]}"#)
+        requests[0].2(0, "")
+        precondition(model.selectedSkills.isEmpty && model.skillResults.count == 1 && !model.skillsReady)
+        model.selectedSkills = [row.token]
+        model.selectTarget(target.id)
+        precondition(model.to == nil && !model.skillsReady && model.skillsExportReady)
+        requests = []
+        model.copySkillFiles()
+        precondition(model.copyingSkills && requests[0].0 == ["export-skills", "--json", "--from", source.selector, "--skill", row.token])
+        requests[0].1(#"{"files":["/fixture/write-research.zip"]}"#)
+        requests[0].2(0, "")
+        precondition(!model.copyingSkills && model.skillExportFiles == fixtureSkillFiles && fixtureSkillFiles.count == 1)
+        model.config = Config(node: "/fixture/node", script: "/fixture/transplant.js")
+        requests = []
+        model.loadSkills()
+        let old = requests.last!
+        model.toggle(source.id)
+        old.1("[]"); old.2(0, "")
+        precondition(model.from.isEmpty && model.skillRows.isEmpty && model.skillResults.isEmpty && !model.loadingSkills)
+        print("Skills picker passed")
+    }
+}
+`
+  const file = path.join(root, 'skills.swift'), binary = path.join(root, 'skills'), png = path.join(root, 'skills.png')
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [png], { timeout: 15_000 })
+  assert.match(stdout, /Skills picker passed/)
+  t.diagnostic(`Skills screenshot: ${png}`)
+})
+
+test('skills: export creates private, complete ZIPs without login or overwriting previous exports', async t => {
+  const h = await skillFixture()
+  await h.add('custom')
+  t.mock.method(globalThis, 'fetch', async () => { throw new Error('Export must be offline') })
+  const rows = await selectableSkills(h.paths, [h.source]), tokens = rows.map(row => row.token)
+  const result = await exportSkills(h.paths, [h.source], tokens)
+  assert.equal(result.files.length, 1)
+  assert.ok(result.files[0].startsWith(path.join(h.paths.state, 'skill-exports') + path.sep))
+  assert.equal((await stat(result.files[0])).mode & 0o777, 0o600)
+  assert.equal((await stat(path.dirname(result.files[0]))).mode & 0o777, 0o700)
+  await promisify(execFile)('/usr/bin/unzip', ['-t', result.files[0]])
+  const again = await exportSkills(h.paths, [h.source], tokens)
+  assert.notEqual(again.files[0], result.files[0])
+  const exported = await cli(h.root, ['export-skills', '--from', h.source.account, '--skill', tokens[0], '--json'])
+  assert.equal(exported.code, 0, exported.stderr)
+  assert.equal(JSON.parse(exported.stdout).files.length, 1)
+})
+
+test('skills: duplicate source names and oversized packages are refused before upload', async () => {
+  const h = await skillFixture(), folder = await h.add('custom')
+  const other = { ...h.source, org: h.target.org }
+  const otherRoot = path.join(h.paths.agentSessions, 'skills-plugin', other.org, other.account)
+  await fs.cp(h.cacheRoot, otherRoot, { recursive: true })
+  const rows = await selectableSkills(h.paths, [h.source, other])
+  assert.equal(rows.length, 2)
+  await assert.rejects(copySkills(h.paths, [h.source, other], h.target, rows.map(row => row.token)), /one source/)
+  await fs.truncate(path.join(folder, 'scripts', 'run.sh'), 21 * 1024 * 1024)
+  const oversized = await selectableSkills(h.paths, [h.source])
+  assert.match(oversized[0].problem, /20 MB/)
+  await assert.rejects(exportSkills(h.paths, [h.source], [oversized[0].token]), /unavailable/)
+  await assert.rejects(copySkills(h.paths, [h.source], h.target, Array(51).fill('invalid')), /between 1 and 50/)
 })

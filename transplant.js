@@ -54,6 +54,9 @@ const HELP = `claude-transplant   move Claude Code history between accounts
   claude-transplant keep-local  cancel held work and cloud checks, keep completed moves
   claude-transplant accounts    list accounts
   claude-transplant sessions --from <match> --json  list selectable local sessions
+  claude-transplant skills --from <match> --json    list cached custom skills
+  claude-transplant copy-skills --from <match> --to <match> --skill <token> --json
+  claude-transplant export-skills --from <match> --skill <token> --json
   claude-transplant restart     plan an explicit Desktop restart
   claude-transplant sweep       verify placed metadata and retry the active pending source
   claude-transplant menubar     install the menubar app, --snapshot <png>, --remove uninstalls
@@ -1106,6 +1109,161 @@ const remoteId = (id) => {
   try { return wireRemoteId(id) } catch { return null }
 }
 
+const SKILL_NAME = /^[a-z0-9][a-z0-9_-]{0,127}$/
+const SKILL_BYTES = 20 * 1024 * 1024
+
+async function skillFiles(root) {
+  const canonical = await realpath(root)
+  if (canonical !== path.resolve(root)) throw new Error('Skill cache contains a symbolic link')
+  const files = []
+  let size = 0, entries = 0
+  const walk = async (dir, depth = 0) => {
+    if (depth > 20 || await realpath(dir) !== path.resolve(dir)) throw new Error('Unsupported skill directory')
+    for (const entry of (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))) {
+      if (++entries > 1000) throw new Error('Skill exceeds 1,000 files and folders')
+      if (entry.name === '.DS_Store') continue
+      const file = path.join(dir, entry.name), rel = path.relative(root, file)
+      if (/[\\\x00-\x1f\x7f]/.test(rel) || Buffer.byteLength(rel) > 1000) throw new Error('Unsupported skill filename')
+      if (entry.isDirectory()) { await walk(file, depth + 1); continue }
+      if (!entry.isFile()) throw new Error('Skill contains a symbolic link or unsupported file')
+      const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+      try {
+        const before = await handle.stat()
+        if (!before.isFile() || before.size + size > SKILL_BYTES) throw new Error('Skill exceeds 20 MB')
+        const data = Buffer.alloc(before.size + 1)
+        let read = 0
+        while (read < data.length) {
+          const result = await handle.read(data, read, data.length - read, read)
+          if (!result.bytesRead) break
+          read += result.bytesRead
+        }
+        const after = await handle.stat()
+        if (read !== before.size || after.mtimeMs !== before.mtimeMs || await realpath(file) !== path.resolve(file)) throw new Error('Skill changed while reading. Refresh and try again.')
+        size += read
+        files.push({ name: rel.split(path.sep).join('/'), data: data.subarray(0, read), mode: before.mode })
+      } finally { await handle.close() }
+    }
+  }
+  await walk(root)
+  if (!files.some(file => file.name === 'SKILL.md')) throw new Error('Skill has no SKILL.md')
+  return files
+}
+
+const skillFingerprint = files => sha(files.map(file => `${file.name}\0${file.mode & 0o777}\0${sha(file.data)}`).join('\n'))
+
+export async function selectableSkills(paths, from) {
+  const rows = []
+  for (const source of from) {
+    if (!UUID.test(source.account) || !UUID.test(source.org)) throw new Error('Invalid skill account or organization')
+    const root = path.join(paths.agentSessions, 'skills-plugin', source.org, source.account)
+    const manifest = await readJson(path.join(root, 'manifest.json')).catch(error => { if (error.code === 'ENOENT') return null; throw error })
+    if (!manifest) continue
+    if (!Array.isArray(manifest.skills)) throw new Error('Skill cache format changed')
+    for (const skill of manifest.skills.filter(skill => skill?.creatorType === 'user')) {
+      if (typeof skill.name !== 'string' || !SKILL_NAME.test(skill.name) || typeof skill.skillId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(skill.skillId)) continue
+      let fingerprint = '', bytes = 0, problem = ''
+      try {
+        const files = await skillFiles(path.join(root, 'skills', skill.name))
+        fingerprint = skillFingerprint(files)
+        bytes = files.reduce((sum, file) => sum + file.data.length, 0)
+      } catch (error) { problem = error.code === 'ENOENT' ? 'Not downloaded. Open this account in Claude to sync it.' : error.message }
+      rows.push({ token: `${source.account}/${source.org}/${skill.skillId}/${fingerprint}`, name: skill.name,
+        description: typeof skill.description === 'string' ? skill.description.slice(0, 4000) : '', accountLabel: source.label,
+        account: source.account, org: source.org, updatedAt: skill.updatedAt ?? '', cachedAt: manifest.lastUpdated ?? '', bytes, problem })
+    }
+  }
+  return rows.sort((a, b) => a.name.localeCompare(b.name) || a.accountLabel.localeCompare(b.accountLabel))
+}
+
+export function skillArchive(name, files) {
+  const locals = [], central = []
+  let offset = 0
+  for (const file of files) {
+    const filename = Buffer.from(`${name}/${file.name}`)
+    let crc = 0xffffffff
+    for (const byte of file.data) {
+      crc ^= byte
+      for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
+    }
+    crc = (crc ^ 0xffffffff) >>> 0
+    const local = Buffer.alloc(30), record = Buffer.alloc(46)
+    local.writeUInt32LE(0x04034b50); local.writeUInt16LE(20, 4); local.writeUInt16LE(0x800, 6)
+    local.writeUInt16LE(33, 12); local.writeUInt32LE(crc, 14)
+    local.writeUInt32LE(file.data.length, 18); local.writeUInt32LE(file.data.length, 22); local.writeUInt16LE(filename.length, 26)
+    record.writeUInt32LE(0x02014b50); record.writeUInt16LE(0x314, 4); record.writeUInt16LE(20, 6); record.writeUInt16LE(0x800, 8)
+    record.writeUInt16LE(33, 14); record.writeUInt32LE(crc, 16)
+    record.writeUInt32LE(file.data.length, 20); record.writeUInt32LE(file.data.length, 24); record.writeUInt16LE(filename.length, 28)
+    record.writeUInt32LE(((0o100000 | file.mode & 0o777) << 16) >>> 0, 38); record.writeUInt32LE(offset, 42)
+    locals.push(local, filename, file.data); central.push(record, filename)
+    offset += local.length + filename.length + file.data.length
+  }
+  const directory = Buffer.concat(central), end = Buffer.alloc(22)
+  end.writeUInt32LE(0x06054b50); end.writeUInt16LE(files.length, 8); end.writeUInt16LE(files.length, 10)
+  end.writeUInt32LE(directory.length, 12); end.writeUInt32LE(offset, 16)
+  return Buffer.concat([...locals, directory, end])
+}
+
+async function skillPackages(paths, from, tokens) {
+  if (!tokens.length || tokens.length > 50 || new Set(tokens).size !== tokens.length) throw new Error('Select between 1 and 50 unique skills')
+  const available = await selectableSkills(paths, from)
+  const selected = tokens.map(token => {
+    const row = available.find(row => row.token === token)
+    if (!row || row.problem) throw new Error('A selected skill changed or is unavailable. Refresh and select it again.')
+    return row
+  })
+  if (new Set(selected.map(row => row.name)).size !== selected.length) throw new Error('Select only one source for each skill name')
+  const packages = []
+  let total = 0
+  for (const row of selected) {
+    const files = await skillFiles(path.join(paths.agentSessions, 'skills-plugin', row.org, row.account, 'skills', row.name))
+    if (!row.token.endsWith('/' + skillFingerprint(files))) throw new Error('A selected skill changed. Refresh and select it again.')
+    total += files.reduce((sum, file) => sum + file.data.length, 0)
+    if (total > 50 * 1024 * 1024) throw new Error('Selection exceeds 50 MB. Copy fewer skills at once.')
+    packages.push({ row, zip: skillArchive(row.name, files) })
+  }
+  return packages
+}
+
+export async function exportSkills(paths, from, tokens) {
+  const packages = await skillPackages(paths, from, tokens)
+  const root = path.join(paths.state, 'skill-exports')
+  await mkdir(root, { recursive: true, mode: 0o700 })
+  const folder = await mkdtemp(path.join(root, 'skills-'))
+  try {
+    const files = []
+    for (const { row, zip } of packages) {
+      const file = path.join(folder, `${row.name}.zip`)
+      await writeFile(file, zip, { flag: 'wx', mode: 0o600 })
+      files.push(file)
+    }
+    return { files }
+  } catch (error) { await rm(folder, { recursive: true, force: true }); throw error }
+}
+
+export async function copySkills(paths, from, to, tokens, io = {}) {
+  if (!UUID.test(to.account) || !UUID.test(to.org) || from.some(source => sameAccount(source, to))) throw new Error('Choose a different destination account or organization')
+  const packages = await skillPackages(paths, from, tokens)
+  const cloud = io.cloud ?? await cloudClient(paths, to)
+  if (cloud.account !== to.account || cloud.org !== to.org) throw new Error('Skill destination identity changed')
+  const existing = new Set((await cloud.skills()).map(skill => skill.name?.toLowerCase()))
+  const results = []
+  for (const { row, zip } of packages) {
+    if (existing.has(row.name)) { results.push({ token: row.token, name: row.name, status: 'skipped', detail: 'Already exists; kept the destination version.' }); continue }
+    try {
+      const response = await cloud.uploadSkill(row.name, zip)
+      if (response?.validation_errors?.length) throw new Error('Claude rejected this skill package. Review it in Customize → Skills.')
+      if (typeof response?.skill?.id !== 'string' || !response.skill.id) throw new Error('Upload outcome is unconfirmed. Check Customize → Skills before retrying.')
+      existing.add(row.name)
+      results.push({ token: row.token, name: row.name, status: 'copied', detail: response.scan_requested || response.awaiting_make_current ? 'Uploaded; Claude is reviewing it. Check Customize → Skills.' : response.skill.enabled === true ? 'Copied; Claude enabled it. Review it in Customize → Skills.' : 'Copied. Check Customize → Skills to enable it.' })
+    } catch (error) {
+      results.push({ token: row.token, name: row.name, status: 'failed', detail: error.code === 'CLOUD_HTTP_ERROR' ? 'Claude refused the upload. Check Customize → Skills; an existing skill is never replaced.' : error.message })
+      break
+    }
+  }
+  for (const { row } of packages) if (!results.some(result => result.token === row.token)) results.push({ token: row.token, name: row.name, status: 'not-copied', detail: 'Not attempted after the previous upload failed.' })
+  return { ok: results.every(result => ['copied', 'skipped'].includes(result.status)), results }
+}
+
 export async function cloudClient(paths, expected = null, io = {}) {
   const memory = io.memory ?? operationMemory()
   const current = io.active ?? await signedIn(paths)
@@ -1187,6 +1345,17 @@ export async function cloudClient(paths, expected = null, io = {}) {
     memory,
     account: account.uuid,
     org,
+    skills: async () => {
+      const body = await request(`/api/organizations/${org}/skills/list-skills?include_wiggle_skills=true&entrypoint=local-agent`)
+      if (!Array.isArray(body?.skills) || body.skills.some(skill => typeof skill?.name !== 'string')) throw new Error('Claude skill list response changed')
+      return body.skills
+    },
+    uploadSkill: (name, zip) => {
+      const body = new FormData()
+      body.append('file', new Blob([zip], { type: 'application/zip' }), `${name}.skill`)
+      const query = new URLSearchParams({ overwrite: 'false', check_skill_name: name, auto_enable: 'never' })
+      return request(`/api/organizations/${org}/skills/upload-skill?${query}`, { method: 'POST', body, signal: AbortSignal.timeout(120_000) })
+    },
     list: async () => {
       const query = new URLSearchParams({ statuses: 'active', limit: '100' })
       query.append('statuses', 'paused')
@@ -5233,12 +5402,13 @@ async function menubar(paths, remove, snapshot) {
 }
 
 function parse(argv) {
-  const args = { from: [], sessions: [], to: null, cmd: null, dry: false, cloud: false, json: false, help: false, version: false, remove: false, snapshot: null, restartApproved: null, moveOnly: false, leaveChecks: [] }
+  const args = { from: [], sessions: [], skills: [], to: null, cmd: null, dry: false, cloud: false, json: false, help: false, version: false, remove: false, snapshot: null, restartApproved: null, moveOnly: false, leaveChecks: [] }
   const value = (i) => { if (argv[i] === undefined || argv[i].startsWith('-')) throw new Error(`${argv[i - 1]} needs a value`); return argv[i] }
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
     if (a === '--from') args.from.push(value(++i))
     else if (a === '--session') args.sessions.push(value(++i))
+    else if (a === '--skill') args.skills.push(value(++i))
     else if (a === '--to') args.to = value(++i)
     else if (a === '--dry-run') args.dry = true
     else if (a === '--cloud') args.cloud = true
@@ -5253,6 +5423,12 @@ function parse(argv) {
     else if (!a.startsWith('-') && !args.cmd) args.cmd = a
     else throw new Error(`unknown argument ${a}`)
   }
+  if (['skills', 'copy-skills', 'export-skills'].includes(args.cmd)) {
+    if (!args.from.length || args.sessions.length || args.dry || args.cloud || args.remove || args.snapshot || args.restartApproved || args.moveOnly || args.leaveChecks.length || args.help || args.version ||
+        (args.cmd === 'skills' ? args.to || args.skills.length : !args.skills.length || (args.cmd === 'copy-skills' ? !args.to : args.to))) throw new Error('Use skills --from <match> --json, copy-skills --from <match> --to <match> --skill <token> --json, or export-skills --from <match> --skill <token> --json')
+    return args
+  }
+  if (args.skills.length) throw new Error('--skill requires copy-skills or export-skills')
   if (args.cmd !== 'sessions' && (args.from.length > 0) !== Boolean(args.to)) throw new Error('--from and --to go together')
   if (args.cmd === 'sessions' && (!args.from.length || args.to || args.sessions.length || args.dry || args.cloud || args.restartApproved || args.moveOnly)) throw new Error('sessions requires --from and accepts only --json')
   if (args.sessions.length && (args.cmd || !args.from.length || args.cloud)) throw new Error('--session requires --from and --to; selected-session moves are local only, without --cloud')
@@ -5476,6 +5652,13 @@ async function main(argv) {
     ].filter((line) => line !== null).join('\n'))
   }
   const all = await accounts(paths)
+  if (args.cmd === 'skills') return emit(await selectableSkills(paths, args.from.map(selector => find(all, selector))))
+  if (args.cmd === 'export-skills') return emit(await exportSkills(paths, args.from.map(selector => find(all, selector)), args.skills))
+  if (args.cmd === 'copy-skills') {
+    const result = await locked(paths, () => copySkills(paths, args.from.map(selector => find(all, selector)), find(all, args.to), args.skills))
+    if (!result.ok) process.exitCode = 1
+    return emit(result)
+  }
   if (args.cmd === 'sessions') {
     const rows = selectableSessions(args.from.map(selector => find(all, selector)), processTable(paths.claudeApp))
     return args.json ? emit(rows) : out.write(rows.map(row => `${row.token}  ${row.title}  ${row.project}  ${ago(row.activeAt)}${row.running ? ' | running' : ''}`).join('\n') + '\n')
