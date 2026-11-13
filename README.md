@@ -10,7 +10,7 @@ With Node 22 or newer and the Xcode command-line tools installed, run this from 
 node transplant.js menubar
 ```
 
-This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel shows version **4.2.1-nick.7**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
+This replaces the installed menu-bar app and retains its existing receipts, backups, and login launch configuration. The panel shows version **4.2.1-nick.8**. Upstream update offers are disabled so an update cannot accidentally replace the custom picker. Use the repository's `upstream` remote to review and merge future upstream changes manually.
 
 ## Choose what to move
 
@@ -25,7 +25,7 @@ Related forks, shared session records, and scheduled-task sessions are selected 
 
 The picker moves **local Code sessions only**. Cloud copies are kept. Transcripts and project files remain in place; source sidebar records are backed up using the existing transfer engine. Undo and interrupted-move recovery use the original engine. Running sessions may still require a restart of all of Claude Desktop, including unrelated work.
 
-Empty account/org folders without saved login evidence are hidden from the menu. This is a local-data filter, not a live organization-membership lookup.
+Empty account/org folders without saved login evidence are hidden from the menu, unless you explicitly named the account/org pair in `account-labels.json`. Named pairs remain available even if their login cache expires or their empty session directory disappears. A saved name does not mark a login or organization membership as verified.
 
 Friendly account labels can be stored locally in `~/Library/Application Support/claude-transplant/account-labels.json`, keyed by `ACCOUNT_UUID/ORG_UUID`, with optional `name` and `org` strings. These are display aliases, not verified membership or changes to Claude's login. Hover an account row to see both full IDs. Keep this personal file outside the repository. Both `account-labels.json*` and `account-order.json*` are also gitignored to protect accidental copies into the checkout.
 

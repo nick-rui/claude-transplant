@@ -12853,3 +12853,68 @@ test('skills: mixed local and Desktop sources require choosing one version of a 
   assert.equal(new Set(rows.map(row => row.token)).size, 2)
   await assert.rejects(exportSkills(h.paths, [h.source], rows.map(row => row.token), { local: true }), /one source/)
 })
+
+test('named accounts: saved names survive missing login caches and session directories without claiming authentication', async () => {
+  const h = await home(), account = id(7901), org = id(7902)
+  await mkdir(h.paths.state, { recursive: true })
+  await writeFile(path.join(h.paths.state, 'account-labels.json'), JSON.stringify({
+    [`${account}/${org}`]: { name: 'saved@example.com', org: 'Personal' },
+    [`${account}/../../outside`]: { name: 'Invalid path' },
+    [`${id(7903)}/${org}`]: { name: 'Bad\nname' },
+    [`${id(7904)}/${org}`]: { org: 'Unnamed org' }
+  }))
+  const all = await accounts(h.paths, [])
+  const saved = all.find(row => row.account === account)
+  assert.ok(saved)
+  assert.equal(saved.displayName, 'saved@example.com')
+  assert.equal(saved.locallyNamed, true)
+  assert.equal(saved.confirmed, false)
+  assert.equal(saved.active, false)
+  assert.equal(saved.signedIn, false)
+  assert.equal(saved.email, null)
+  assert.deepEqual(saved.sessions, [])
+  assert.equal(await stat(saved.dir).catch(() => null), null)
+  assert.equal(all.filter(row => row.account === account).length, 1)
+  assert.ok(!all.some(row => [id(7903), id(7904)].includes(row.account)))
+  const result = await cli(h.root, ['accounts', '--json'])
+  assert.equal(result.code, 0, result.stderr)
+  const listed = JSON.parse(result.stdout).find(row => row.account === account)
+  assert.equal(listed.locallyNamed, true)
+  assert.equal(listed.confirmed, false)
+  assert.equal(listed.sessions, 0)
+  await writeFile(path.join(h.paths.state, 'account-labels.json'), '{}')
+  assert.ok(!(await accounts(h.paths, [])).some(row => row.account === account))
+})
+
+test('named accounts: Swift keeps explicitly named empty accounts in both columns while hiding unnamed ghosts', async t => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ct-named-accounts-'))
+  const source = await swiftFixtureSource(false) + String.raw`
+@main
+struct NamedAccountChecks {
+    @MainActor static func main() throws {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        let active = Account(account: "active", org: "work", email: "work@example.com", orgName: "Work", label: "Work", active: true, signedIn: true, activeAt: 100, pending: nil, pendingFailures: nil, confirmed: true, sessions: 1)
+        let saved = try JSONDecoder().decode(Account.self, from: Data(#"{"account":"saved","org":"personal","label":"saved@example.com · Personal","displayName":"saved@example.com","displayOrg":"Personal","confirmed":false,"locallyNamed":true,"sessions":0,"activeAt":1}"#.utf8))
+        let ghost = Account(account: "saved", org: "ghost", email: nil, orgName: nil, label: "Ghost", active: false, signedIn: false, activeAt: 0, pending: nil, pendingFailures: nil, confirmed: false, sessions: 0)
+        let model = Model(demo: [active, saved, ghost])
+        precondition(model.visibleAccounts.map(\.id) == [active.id, saved.id])
+        for side in ["from", "to"] { precondition(model.orderedAccounts(side).contains { $0.id == saved.id }) }
+        if model.to != saved.id { model.selectTarget(saved.id) }
+        model.selectTarget(saved.id)
+        precondition(model.to == nil && model.visibleAccounts.contains { $0.id == saved.id })
+        model.selectTarget(saved.id)
+        precondition(model.to == saved.id && model.primaryTitle == nil)
+        precondition(!model.visibleAccounts.contains { $0.id == ghost.id })
+        guard let image = Snapshot.data(model) else { fatalError("No account image") }
+        try image.write(to: URL(fileURLWithPath: CommandLine.arguments[1]))
+        print("Named accounts passed")
+    }
+}
+`
+  const file = path.join(root, 'named.swift'), binary = path.join(root, 'named'), png = path.join(root, 'named.png')
+  await writeFile(file, source)
+  await promisify(execFile)('/usr/bin/swiftc', ['-parse-as-library', '-o', binary, file], { timeout: 90_000 })
+  const { stdout } = await promisify(execFile)(binary, [png], { timeout: 15_000 })
+  assert.match(stdout, /Named accounts passed/)
+  t.diagnostic(`Named account screenshot: ${png}`)
+})

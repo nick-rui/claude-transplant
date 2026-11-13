@@ -1407,6 +1407,10 @@ export async function accounts(paths, processes = null) {
   const cur = await signedIn(paths, processes)
   const aliases = await readJson(path.join(paths.state, 'account-labels.json')).catch(() => ({}))
   const aliasText = value => typeof value === 'string' && value.trim() && value.length <= 100 && !/[\x00-\x1f\x7f]/.test(value) ? value.trim() : null
+  for (const [key, alias] of Object.entries(aliases ?? {})) {
+    const parts = key.split('/')
+    if (parts.length === 2 && parts.every(part => UUID.test(part)) && aliasText(alias?.name)) pairs.set(key, { account: parts[0], org: parts[1] })
+  }
   const out = []
   const stored = await records(paths.records)
   const known = [...pairs.values()].filter((pair) => !stored.some((row) => sameAccount(row, pair))).map(({ account, org }) => ({ account, org, dir: path.join(paths.records, account, org), files: [] }))
@@ -1431,7 +1435,7 @@ export async function accounts(paths, processes = null) {
     const label = `${displayName} · ${displayOrg}`
     const base = sessions.length ? `${sessions.length} | ${ago(activeAt)} | ${mode(sessions.map((s) => path.basename(s.cwd)))}` : '0 | -'
     const stats = `${base}${unreadable.length ? ` | ${unreadable.length} unreadable` : ''}${taskError ? ' | task registry unreadable' : ''}`
-    out.push({ account, org, dir, email, orgName, displayName, displayOrg, confirmed: confirmed.has(`${account}/${org}`), sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state })
+    out.push({ account, org, dir, email, orgName, displayName, displayOrg, locallyNamed: Boolean(aliasText(alias?.name)), confirmed: confirmed.has(`${account}/${org}`), sessions, allSessions: sessions, unreadable, taskFile, taskSessions: scheduled, taskError, activeAt, focusedAt: Math.max(0, ...sessions.map((s) => s.focusedAt)), label, stats, active: false, signedIn: sameLogin({ account }, cur), identityState: cur.state })
   }
   const sessions = out.flatMap(account => account.sessions)
   const claims = Map.groupBy(sessions.flatMap(session => [...new Set([session.id, ...priorSessions(session.record)])]), id => id)
@@ -5701,7 +5705,7 @@ async function main(argv) {
       const timeouts = deferred?.mode === 'local' ? await idleTimeouts(paths, table) : new Map()
       const summary = latest?.receipt ? receiptSummary(latest.receipt) : null
       const done = summary && !deferred && !recoveryProblem && !needsRecovery(latest.receipt) && finishOkay(latest.receipt) ? latest.receipt.to : null
-      return emit(all.map(({ account, org, email, orgName, displayName, displayOrg, confirmed, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
+      return emit(all.map(({ account, org, email, orgName, displayName, displayOrg, locallyNamed, confirmed, label, stats, active, signedIn, identityState, sessions, unreadable, activeAt }) => {
         const source = deferred?.sources.find((candidate) => sameAccount(candidate, { account, org }))
         const waiting = source ? deferred.mode === 'local'
           ? waitingSessions({ held: deferred.receipt.held?.filter(held => held.sources.some(member => sameAccount(member, source))), cloudChecks: deferred.receipt.cloudChecks.filter(check => sameAccount(check, source)) })
@@ -5717,6 +5721,7 @@ async function main(argv) {
           orgName,
           displayName,
           displayOrg,
+          locallyNamed,
           confirmed,
           label,
           stats,

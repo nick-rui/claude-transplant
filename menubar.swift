@@ -15,6 +15,7 @@ struct Account: Decodable, Identifiable {
     let pendingFailures: [Failure]?
     var stats: String? = nil
     var confirmed: Bool? = nil
+    var locallyNamed: Bool? = nil
     var displayName: String? = nil
     var displayOrg: String? = nil
     var identityState: String? = nil
@@ -549,7 +550,7 @@ final class Model: ObservableObject {
         return true
     }
 
-    private func listed(_ account: Account) -> Bool { account.active == true || account.confirmed == true || (account.confirmed == nil && (account.email != nil || account.sessions != 0)) || (account.sessions ?? 0) > 0 || account.pending != nil }
+    private func listed(_ account: Account) -> Bool { account.active == true || account.confirmed == true || account.locallyNamed == true || (account.confirmed == nil && (account.email != nil || account.sessions != 0)) || (account.sessions ?? 0) > 0 || account.pending != nil }
     private var latestReceipt: String? { accounts.lazy.compactMap(\.receipt).first }
     private func signInNeeded(_ account: Account) -> Bool { account.pendingAction == "sign-in" && account.identityState != "unknown" }
     private var leaveChecks: [String] {
